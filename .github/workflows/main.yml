@@ -81,7 +81,9 @@ jobs:
           import android.accessibilityservice.AccessibilityService
           import android.accessibilityservice.GestureDescription
           import android.graphics.Bitmap
+          import android.graphics.Canvas
           import android.graphics.Color
+          import android.graphics.Paint
           import android.graphics.Path
           import android.graphics.Rect
           import android.os.Build
@@ -89,6 +91,7 @@ jobs:
           import android.view.Display
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
+          import org.json.JSONArray
           import java.io.File
           import java.io.FileOutputStream
           import java.util.concurrent.CountDownLatch
@@ -124,9 +127,9 @@ jobs:
               }
 
               /**
-               * Human Eye (العين البشرية): Captures real-time screen pixels (including OpenGL/Unity/Vulkan games),
-               * saves a compressed frame for Cloud Vision models, and runs an on-device Visual Game Radar
-               * so both Cloud and Local GGUF agents get exact (x, y) target coordinates.
+               * Human Eye (العين البشرية): Captures real-time screen pixels, draws a calibrated
+               * real-screen (x, y) coordinate grid directly onto the image for 100% first-tap accuracy,
+               * and runs an on-device Visual Game Radar.
                */
               fun captureScreenVision(): String {
                   val dm = resources.displayMetrics
@@ -142,11 +145,8 @@ jobs:
                   sb.appendLine("Screen Resolution: ${screenW}x${screenH} ($orientation)")
                   sb.appendLine("Active App/Game Package: $activePkg")
                   sb.appendLine(
-                      "Key Game Zones: Center=(${screenW / 2},${screenH / 2}) | " +
-                          "LeftJoystick=(${(screenW * 0.20).toInt()},${(screenH * 0.72).toInt()}) | " +
-                          "RightActionPad=(${(screenW * 0.80).toInt()},${(screenH * 0.72).toInt()}) | " +
-                          "TopHUD=(${screenW / 2},${(screenH * 0.08).toInt()}) | " +
-                          "BottomBar=(${screenW / 2},${(screenH * 0.90).toInt()})"
+                      "IMPORTANT: The attached image has a calibrated coordinate grid drawn on it showing REAL screen (x,y) coordinates. " +
+                          "Read the (x,y) numbers directly from the grid on the image, and pass multiple moves at once in game_action 'steps'!"
                   )
 
                   var capturedBitmap: Bitmap? = null
@@ -164,7 +164,7 @@ jobs:
                                           val colorSpace = screenshot.colorSpace
                                           val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
                                           if (hwBitmap != null) {
-                                              capturedBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                              capturedBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, true)
                                               hwBitmap.recycle()
                                           }
                                           hwBuffer.close()
@@ -186,29 +186,26 @@ jobs:
                   val bmp = capturedBitmap
                   if (bmp != null) {
                       try {
-                          // 1. Run On-Device Visual Radar for Local GGUF & Fast Game Targeting
+                          // 1. Run On-Device Visual Radar before drawing grid overlay
                           val radarReport = analyzeBitmapForGames(bmp, screenW, screenH)
                           sb.appendLine(radarReport)
 
-                          // 2. Save scaled JPEG frame for Multimodal Cloud Vision injection
-                          val maxDim = 768
+                          // 2. Scale image for fast multimodal upload and draw calibrated real-screen (x,y) coordinate grid
+                          val maxDim = 800
                           val scale = min(1.0f, maxDim.toFloat() / max(bmp.width, bmp.height).toFloat())
                           val targetW = max(1, (bmp.width * scale).toInt())
                           val targetH = max(1, (bmp.height * scale).toInt())
-                          val scaled = if (scale < 1.0f) {
-                              Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
-                          } else {
-                              bmp
-                          }
+                          val scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
+                              .copy(Bitmap.Config.ARGB_8888, true)
+
+                          drawCalibratedCoordinateGrid(scaled, screenW, screenH)
 
                           val outFile = File(applicationContext.cacheDir, "human_eye_latest.jpg")
                           FileOutputStream(outFile).use { fos ->
-                              scaled.compress(Bitmap.CompressFormat.JPEG, 72, fos)
+                              scaled.compress(Bitmap.CompressFormat.JPEG, 76, fos)
                               fos.flush()
                           }
-                          if (scaled !== bmp) {
-                              scaled.recycle()
-                          }
+                          scaled.recycle()
                           bmp.recycle()
 
                           sb.appendLine("[SCREEN_VISION_IMAGE:${outFile.absolutePath}]")
@@ -219,8 +216,7 @@ jobs:
                       sb.appendLine("Note: Live pixel buffer unavailable on this Android version or protected surface; using UI tree.")
                   }
 
-                  // 3. Also append interactive UI elements if any exist on screen
-                  val uiHierarchy = dumpUiHierarchy(maxNodes = 45)
+                  val uiHierarchy = dumpUiHierarchy(maxNodes = 35)
                   sb.appendLine("=== UI OVERLAY ELEMENTS ===")
                   sb.appendLine(uiHierarchy)
 
@@ -228,9 +224,61 @@ jobs:
               }
 
               /**
-               * Scans the live game/screen Bitmap on-device to detect visual hotspots, buttons,
-               * high-contrast targets, and dominant scene colors with exact screen coordinates (x, y).
+               * Draws a subtle 6x8 coordinate grid with real-screen (x, y) labels onto the scaled screenshot
+               * so Vision LLMs never have to guess pixel coordinates.
                */
+              private fun drawCalibratedCoordinateGrid(bmp: Bitmap, realW: Int, realH: Int) {
+                  val canvas = Canvas(bmp)
+                  val w = bmp.width.toFloat()
+                  val h = bmp.height.toFloat()
+                  val cols = 6
+                  val rows = 8
+
+                  val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.argb(110, 0, 255, 255)
+                      strokeWidth = 1.2f
+                      style = Paint.Style.STROKE
+                  }
+                  val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.argb(220, 255, 255, 0)
+                      style = Paint.Style.FILL
+                  }
+                  val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.argb(165, 0, 0, 0)
+                      style = Paint.Style.FILL
+                  }
+                  val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.rgb(255, 255, 100)
+                      textSize = max(11f, min(w, h) * 0.024f)
+                      isFakeBoldText = true
+                  }
+
+                  for (c in 1 until cols) {
+                      val gx = (w * c) / cols
+                      canvas.drawLine(gx, 0f, gx, h, linePaint)
+                  }
+                  for (r in 1 until rows) {
+                      val gy = (h * r) / rows
+                      canvas.drawLine(0f, gy, w, gy, linePaint)
+                  }
+
+                  for (r in 1 until rows) {
+                      for (c in 1 until cols) {
+                          val gx = (w * c) / cols
+                          val gy = (h * r) / rows
+                          val realX = (realW * c) / cols
+                          val realY = (realH * r) / rows
+                          val label = "$realX,$realY"
+
+                          canvas.drawCircle(gx, gy, 3f, dotPaint)
+                          val tw = textPaint.measureText(label)
+                          val th = textPaint.textSize
+                          canvas.drawRect(gx + 3f, gy - th, gx + tw + 7f, gy + 3f, bgPaint)
+                          canvas.drawText(label, gx + 5f, gy - 1f, textPaint)
+                      }
+                  }
+              }
+
               private fun analyzeBitmapForGames(bmp: Bitmap, screenW: Int, screenH: Int): String {
                   val cols = 8
                   val rows = 12
@@ -272,7 +320,6 @@ jobs:
                           val saturation = hsv[1]
                           val brightness = hsv[2]
 
-                          // High contrast + vibrant saturation indicates interactive game buttons, sprites, or targets
                           val score = diff * (0.6 + saturation * 0.8) * (if (brightness > 0.2f) 1.0 else 0.4)
                           if (score > 28.0) {
                               val realX = ((cx.toFloat() / bw.toFloat()) * screenW).toInt()
@@ -337,9 +384,52 @@ jobs:
               }
 
               /**
-               * Executes human-like gaming reflexes: fast tap, double_tap, hold/long_press,
-               * virtual joystick drag, or simultaneous 2-finger multi-touch (move + shoot/jump).
+               * Clamps game coordinates away from the very top status bar and very bottom Android navigation bar
+               * so game taps never accidentally switch apps or trigger Home/Back.
                */
+              private fun safeX(x: Float): Float {
+                  val w = resources.displayMetrics.widthPixels.toFloat()
+                  return x.coerceIn(12f, max(20f, w - 12f))
+              }
+
+              private fun safeY(y: Float): Float {
+                  val h = resources.displayMetrics.heightPixels.toFloat()
+                  return y.coerceIn(45f, max(100f, h - 75f))
+              }
+
+              /**
+               * Executes a batch sequence of game actions in a SINGLE tool call so the agent can solve
+               * an entire puzzle level (e.g. tapping 9 matching cars in order) without 20 round-trips.
+               */
+              fun performGameBatch(stepsJson: String): String {
+                  return try {
+                      val arr = JSONArray(stepsJson)
+                      val results = mutableListOf<String>()
+                      val count = min(arr.length(), 20)
+                      for (i in 0 until count) {
+                          val obj = arr.getJSONObject(i)
+                          val type = obj.optString("action_type", "tap")
+                          val x = obj.optDouble("x", 540.0).toFloat()
+                          val y = obj.optDouble("y", 1200.0).toFloat()
+                          val endX = obj.optDouble("end_x", x.toDouble()).toFloat()
+                          val endY = obj.optDouble("end_y", y.toDouble()).toFloat()
+                          val secondX = obj.optDouble("second_x", 850.0).toFloat()
+                          val secondY = obj.optDouble("second_y", 1600.0).toFloat()
+                          val durationMs = obj.optLong("duration_ms", 65L)
+                          val waitAfterMs = obj.optLong("wait_ms", 380L).coerceIn(80L, 3000L)
+
+                          val ok = performGameAction(type, x, y, endX, endY, secondX, secondY, durationMs)
+                          results.add("Step ${i + 1}: $type(${x.toInt()},${y.toInt()}) -> ${if (ok) "OK" else "FAIL"}")
+                          if (i < count - 1) {
+                              Thread.sleep(waitAfterMs)
+                          }
+                      }
+                      "Executed ${results.size} batch game steps:\n" + results.joinToString("\n")
+                  } catch (e: Exception) {
+                      "Batch execution error: ${e.message}"
+                  }
+              }
+
               fun performGameAction(
                   actionType: String,
                   x: Float,
@@ -350,33 +440,38 @@ jobs:
                   secondY: Float,
                   durationMs: Long
               ): Boolean {
+                  val sx = safeX(x)
+                  val sy = safeY(y)
+                  val ex = safeX(endX)
+                  val ey = safeY(endY)
+                  val s2x = safeX(secondX)
+                  val s2y = safeY(secondY)
+
                   return when (actionType.trim().lowercase()) {
                       "tap", "fast_tap" -> {
-                          tapCoordinates(x, y, durationMs.coerceIn(35L, 250L))
+                          tapCoordinates(sx, sy, durationMs.coerceIn(40L, 250L))
                       }
                       "double_tap" -> {
-                          val ok1 = tapCoordinates(x, y, 45L)
+                          val ok1 = tapCoordinates(sx, sy, 45L)
                           Thread.sleep(70)
-                          val ok2 = tapCoordinates(x, y, 45L)
+                          val ok2 = tapCoordinates(sx, sy, 45L)
                           ok1 && ok2
                       }
                       "hold", "long_press" -> {
-                          tapCoordinates(x, y, durationMs.coerceIn(400L, 8000L))
+                          tapCoordinates(sx, sy, durationMs.coerceIn(400L, 8000L))
                       }
                       "joystick", "drag", "swipe" -> {
-                          swipe(x, y, endX, endY, durationMs.coerceIn(80L, 8000L))
+                          swipe(sx, sy, ex, ey, durationMs.coerceIn(80L, 8000L))
                       }
                       "multi_touch", "two_finger" -> {
-                          // Finger 1: holds or drags (x, y) -> (endX, endY) (e.g. virtual joystick)
-                          // Finger 2: taps or holds (secondX, secondY) (e.g. jump/fire button)
                           val path1 = Path().apply {
-                              moveTo(x, y)
-                              if (abs(endX - x) > 2f || abs(endY - y) > 2f) {
-                                  lineTo(endX, endY)
+                              moveTo(sx, sy)
+                              if (abs(ex - sx) > 2f || abs(ey - sy) > 2f) {
+                                  lineTo(ex, ey)
                               }
                           }
                           val path2 = Path().apply {
-                              moveTo(secondX, secondY)
+                              moveTo(s2x, s2y)
                           }
                           val d1 = durationMs.coerceIn(100L, 5000L)
                           val d2 = min(d1, 180L)
@@ -388,7 +483,7 @@ jobs:
                               .build()
                           dispatchGestureSync(gesture)
                       }
-                      else -> tapCoordinates(x, y, 60L)
+                      else -> tapCoordinates(sx, sy, 60L)
                   }
               }
 
@@ -433,7 +528,7 @@ jobs:
 
                   traverse(root, 0)
                   return if (count == 0) {
-                      "Canvas/Game surface active (${root.packageName}) — use see_screen Visual Radar & game_action coordinates."
+                      "Canvas/Game surface active (${root.packageName}) — use see_screen coordinate grid & game_action."
                   } else {
                       sb.toString().trim()
                   }
@@ -519,7 +614,7 @@ jobs:
                   return setOk
               }
 
-              fun tapCoordinates(x: Float, y: Float, durationMs: Long = 80L): Boolean {
+              fun tapCoordinates(x: Float, y: Float, durationMs: Long = 65L): Boolean {
                   val path = Path().apply { moveTo(x, y) }
                   val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs)
                   val gesture = GestureDescription.Builder().addStroke(stroke).build()
@@ -782,6 +877,7 @@ jobs:
                                               ?: "Error: Accessibility Service is not enabled. Enable PocketStrike in Settings > Accessibility."
                                       }
                                       "gameAction" -> {
+                                          val stepsJson = call.argument<String>("stepsJson")
                                           val actionType = call.argument<String>("actionType") ?: "tap"
                                           val x = (call.argument<Number>("x")?.toFloat()) ?: 540f
                                           val y = (call.argument<Number>("y")?.toFloat()) ?: 1200f
@@ -789,30 +885,34 @@ jobs:
                                           val endY = (call.argument<Number>("endY")?.toFloat()) ?: y
                                           val secondX = (call.argument<Number>("secondX")?.toFloat()) ?: 850f
                                           val secondY = (call.argument<Number>("secondY")?.toFloat()) ?: 1600f
-                                          val durationMs = (call.argument<Number>("durationMs")?.toLong()) ?: 80L
+                                          val durationMs = (call.argument<Number>("durationMs")?.toLong()) ?: 65L
                                           val captureAfter = call.argument<Boolean>("captureAfter") ?: true
 
                                           val svc = PocketStrikeAccessibilityService.instance
                                           if (svc == null) {
                                               "Error: Accessibility Service is not enabled."
                                           } else {
-                                              val ok = svc.performGameAction(
-                                                  actionType = actionType,
-                                                  x = x,
-                                                  y = y,
-                                                  endX = endX,
-                                                  endY = endY,
-                                                  secondX = secondX,
-                                                  secondY = secondY,
-                                                  durationMs = durationMs
-                                              )
-                                              val status = if (ok) {
-                                                  "Executed game_action '$actionType' at ($x, $y)."
+                                              val status = if (!stepsJson.isNullOrBlank()) {
+                                                  svc.performGameBatch(stepsJson)
                                               } else {
-                                                  "Game action '$actionType' failed."
+                                                  val ok = svc.performGameAction(
+                                                      actionType = actionType,
+                                                      x = x,
+                                                      y = y,
+                                                      endX = endX,
+                                                      endY = endY,
+                                                      secondX = secondX,
+                                                      secondY = secondY,
+                                                      durationMs = durationMs
+                                                  )
+                                                  if (ok) {
+                                                      "Executed game_action '$actionType' at (${x.toInt()}, ${y.toInt()})."
+                                                  } else {
+                                                      "Game action '$actionType' failed."
+                                                  }
                                               }
                                               if (captureAfter) {
-                                                  Thread.sleep(220)
+                                                  Thread.sleep(350)
                                                   "$status\n\n" + svc.captureScreenVision()
                                               } else {
                                                   status
@@ -1136,6 +1236,7 @@ jobs:
           # 8. Write clean android_automation_tools.dart
           mkdir -p lib/features/agent/data
           cat << 'EOF_AUTO_DART' > lib/features/agent/data/android_automation_tools.dart
+          import 'dart:convert';
           import 'dart:io';
           import 'package:flutter/services.dart';
           import '../domain/agent_tool.dart';
@@ -1184,22 +1285,39 @@ jobs:
             static AgentTool gameAction() => AgentTool(
                   name: 'game_action',
                   description:
-                      'Executes real-time human-like Android game actions ("tap", "double_tap", "hold", "joystick", "multi_touch") at screen coordinates (x, y) and automatically captures the updated live screen frame so you can keep playing continuously.',
+                      'Executes real-time Android game moves at screen coordinates (x, y). IMPORTANT: Whenever multiple moves/taps are visible on screen (e.g. matching 3 or 9 cars/tiles in a puzzle), ALWAYS pass all moves together in the "steps" array so they execute in ONE fast batch without extra round-trips!',
                   inputSchema: const {
                     'type': 'object',
                     'properties': {
+                      'steps': {
+                        'type': 'array',
+                        'description':
+                            'PREFERRED FOR FAST GAMEPLAY: List of sequential moves to execute in one batch (e.g. [{"action_type":"tap","x":360,"y":900,"wait_ms":350}, {"action_type":"tap","x":540,"y":1100,"wait_ms":350}]).',
+                        'items': {
+                          'type': 'object',
+                          'properties': {
+                            'action_type': {'type': 'string'},
+                            'x': {'type': 'number'},
+                            'y': {'type': 'number'},
+                            'end_x': {'type': 'number'},
+                            'end_y': {'type': 'number'},
+                            'duration_ms': {'type': 'number'},
+                            'wait_ms': {'type': 'number'},
+                          },
+                        },
+                      },
                       'action_type': {
                         'type': 'string',
                         'description':
-                            'One of: "tap" (fast reflex tap), "double_tap", "hold" (long press), "joystick" (drag from x,y to end_x,end_y), or "multi_touch" (hold/drag joystick from x,y to end_x,end_y WITH finger 1 while tapping second_x,second_y WITH finger 2).',
+                            'Single move type if "steps" is not used: "tap", "double_tap", "hold", "joystick", or "multi_touch".',
                       },
                       'x': {
                         'type': 'number',
-                        'description': 'Primary X coordinate in pixels.',
+                        'description': 'Primary X coordinate in pixels (read from the image coordinate grid).',
                       },
                       'y': {
                         'type': 'number',
-                        'description': 'Primary Y coordinate in pixels.',
+                        'description': 'Primary Y coordinate in pixels (read from the image coordinate grid).',
                       },
                       'end_x': {
                         'type': 'number',
@@ -1211,29 +1329,30 @@ jobs:
                       },
                       'second_x': {
                         'type': 'number',
-                        'description':
-                            'Second finger X coordinate (for multi_touch action button like jump/shoot).',
+                        'description': 'Second finger X coordinate for multi_touch.',
                       },
                       'second_y': {
                         'type': 'number',
-                        'description':
-                            'Second finger Y coordinate (for multi_touch action button like jump/shoot).',
+                        'description': 'Second finger Y coordinate for multi_touch.',
                       },
                       'duration_ms': {
                         'type': 'number',
-                        'description':
-                            'Gesture duration in milliseconds (e.g. 60 for tap, 600 for joystick move, 1500 for hold).',
+                        'description': 'Gesture duration in milliseconds (default 65).',
                       },
                       'capture_after': {
                         'type': 'boolean',
                         'description':
-                            'Whether to immediately capture the new screen vision after the move (default: true).',
+                            'Whether to capture the updated screen frame after executing the move/batch (default: true).',
                       },
                     },
-                    'required': ['action_type', 'x', 'y'],
                   },
                   risk: ToolRisk.safe,
                   run: (args) async {
+                    final rawSteps = args['steps'];
+                    String? stepsJson;
+                    if (rawSteps is List && rawSteps.isNotEmpty) {
+                      stepsJson = jsonEncode(rawSteps);
+                    }
                     final actionType = args['action_type'] as String? ?? 'tap';
                     final x = (args['x'] as num?)?.toDouble() ?? 540.0;
                     final y = (args['y'] as num?)?.toDouble() ?? 1200.0;
@@ -1241,10 +1360,11 @@ jobs:
                     final endY = (args['end_y'] as num?)?.toDouble() ?? y;
                     final secondX = (args['second_x'] as num?)?.toDouble() ?? 850.0;
                     final secondY = (args['second_y'] as num?)?.toDouble() ?? 1600.0;
-                    final durationMs = (args['duration_ms'] as num?)?.toInt() ?? 80;
+                    final durationMs = (args['duration_ms'] as num?)?.toInt() ?? 65;
                     final captureAfter = args['capture_after'] as bool? ?? true;
                     try {
                       final res = await _channel.invokeMethod<String>('gameAction', {
+                        'stepsJson': stepsJson,
                         'actionType': actionType,
                         'x': x,
                         'y': y,
@@ -1255,7 +1375,7 @@ jobs:
                         'durationMs': durationMs,
                         'captureAfter': captureAfter,
                       });
-                      return res ?? 'Executed game action $actionType';
+                      return res ?? 'Executed game action';
                     } catch (e) {
                       return 'Failed to execute game_action: $e';
                     }
@@ -4398,6 +4518,7 @@ jobs:
                     );
                     break;
                   case AgentToolCallStartedEvent(:final call):
+                    buffer.clear();
                     steps.add(AgentStep(
                       type: 'toolCall',
                       timestamp: DateTime.now(),
@@ -4663,10 +4784,11 @@ jobs:
               if (state.agentMode || state.localMode) {
                 const agentImageInstruction =
                     'You have full capabilities to generate images using the "generate_image" tool. When the user asks you to generate, create, draw, paint, design, or render an image, artwork, illustration, photo, or wallpaper, ALWAYS call the "generate_image" tool with a detailed, creative visual prompt and "1:1" aspect ratio unless specified otherwise.\n\n'
-                    'HUMAN EYE VISION & ANDROID GAME / PHONE CONTROL:\n'
-                    '- You have a real-time Human Eye tool ("see_screen") that captures the live phone screen (including fullscreen games) and returns a Visual Radar of target coordinates (x, y).\n'
-                    '- You have a real-time Game Controller tool ("game_action") supporting "tap", "double_tap", "hold", "joystick" (drag), and "multi_touch" (2-finger simultaneous move + action), which also captures the next live frame automatically.\n'
-                    '- You also have "open_app", "click_element", "tap_screen", "type_text", "swipe_screen", and "navigate_phone". Always use these tools directly when asked to open apps, see the screen, or play games!';
+                    'HUMAN EYE VISION & FAST BATCH ANDROID GAME CONTROL:\n'
+                    '1. Call "see_screen" to capture the live screen with a calibrated (x,y) coordinate grid drawn directly on the image.\n'
+                    '2. Read the exact (x,y) pixel coordinates of every target directly from the yellow/cyan coordinate labels drawn on the image.\n'
+                    '3. CRITICAL FOR SPEED: Never tap one item at a time! When multiple moves are visible (e.g. matching 3 or 9 cars/tiles), pass ALL moves together in ONE "game_action" call using the "steps" array (e.g. "steps": [{"action_type":"tap","x":360,"y":920,"wait_ms":400}, {"action_type":"tap","x":540,"y":1150,"wait_ms":400}, ...]).\n'
+                    '4. Do NOT output long text explanations before or between tool calls — invoke tools immediately with zero filler text, and only write a brief summary after the task/level is finished!';
                 systemPrompt = systemPrompt.isEmpty
                     ? agentImageInstruction
                     : '$systemPrompt\n\n$agentImageInstruction';
