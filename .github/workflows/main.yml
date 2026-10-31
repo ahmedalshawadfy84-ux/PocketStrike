@@ -145,8 +145,11 @@ jobs:
                   sb.appendLine("Screen Resolution: ${screenW}x${screenH} ($orientation)")
                   sb.appendLine("Active App/Game Package: $activePkg")
                   sb.appendLine(
-                      "IMPORTANT: The attached image has a calibrated coordinate grid drawn on it showing REAL screen (x,y) coordinates. " +
-                          "Read the (x,y) numbers directly from the grid on the image, and pass multiple moves at once in game_action 'steps'!"
+                      "COORDINATE GUIDE: Read real screen (x,y) coordinates from the yellow grid labels on the attached image."
+                  )
+                  sb.appendLine(
+                      "SAFETY & GOAL CHECK: (1) Avoid tapping Top-Right/Top-Left HUD corners (y < ${(screenH * 0.16).toInt()}) where Settings/Pause gear icons live. " +
+                          "(2) Check the current Level/screen state against the user request: if the requested level or goal is already completed (e.g. user asked for Level 1 only and screen now shows Victory or Level 2), STOP calling tools immediately and report completion!"
                   )
 
                   var capturedBitmap: Bitmap? = null
@@ -324,12 +327,12 @@ jobs:
                           if (score > 28.0) {
                               val realX = ((cx.toFloat() / bw.toFloat()) * screenW).toInt()
                               val realY = ((cy.toFloat() / bh.toFloat()) * screenH).toInt()
+                              if (r < 2) continue // Skip top HUD bar (Settings gear / Pause / Coins) during gameplay
                               val zone = when {
-                                  r < 2 -> "Top-HUD"
-                                  r >= rows - 2 -> "Bottom-Control"
-                                  c < 3 -> "Left-Side"
-                                  c >= cols - 3 -> "Right-Side"
-                                  else -> "Center-Arena"
+                                  r >= rows - 2 -> "Bottom-Bar (Powerups)"
+                                  c < 3 -> "Play-Arena-Left"
+                                  c >= cols - 3 -> "Play-Arena-Right"
+                                  else -> "Play-Arena-Center"
                               }
                               hotspots.add(
                                   Hotspot(
@@ -4518,7 +4521,7 @@ jobs:
                     );
                     break;
                   case AgentToolCallStartedEvent(:final call):
-                    buffer.clear();
+                    if (buffer.isNotEmpty && !buffer.toString().endsWith('\n\n')) buffer.write('\n\n');
                     steps.add(AgentStep(
                       type: 'toolCall',
                       timestamp: DateTime.now(),
@@ -4786,9 +4789,10 @@ jobs:
                     'You have full capabilities to generate images using the "generate_image" tool. When the user asks you to generate, create, draw, paint, design, or render an image, artwork, illustration, photo, or wallpaper, ALWAYS call the "generate_image" tool with a detailed, creative visual prompt and "1:1" aspect ratio unless specified otherwise.\n\n'
                     'HUMAN EYE VISION & FAST BATCH ANDROID GAME CONTROL:\n'
                     '1. Call "see_screen" to capture the live screen with a calibrated (x,y) coordinate grid drawn directly on the image.\n'
-                    '2. Read the exact (x,y) pixel coordinates of every target directly from the yellow/cyan coordinate labels drawn on the image.\n'
-                    '3. CRITICAL FOR SPEED: Never tap one item at a time! When multiple moves are visible (e.g. matching 3 or 9 cars/tiles), pass ALL moves together in ONE "game_action" call using the "steps" array (e.g. "steps": [{"action_type":"tap","x":360,"y":920,"wait_ms":400}, {"action_type":"tap","x":540,"y":1150,"wait_ms":400}, ...]).\n'
-                    '4. Do NOT output long text explanations before or between tool calls — invoke tools immediately with zero filler text, and only write a brief summary after the task/level is finished!';
+                    '2. Read the exact (x,y) pixel coordinates of targets inside the central play arena from the yellow coordinate labels on the image. NEVER tap the top HUD corners (such as the Settings gear icon at top-right) unless explicitly asked.\n'
+                    '3. BATCH MOVES FOR SPEED: When multiple moves are visible (e.g. matching 3 or 9 cars/tiles), pass ALL moves together in ONE "game_action" call using the "steps" array (e.g. "steps": [{"action_type":"tap","x":360,"y":920,"wait_ms":380}, ...]).\n'
+                    '4. BRIEF LIVE UPDATES: Before each tool call, write ONLY ONE short sentence (1 line) telling the user what you are doing now.\n'
+                    '5. STRICT STOP CONDITION: Respect the exact scope of the user request! If the user asks to complete a specific level (e.g. "المستوى الأول فقط" / Level 1 only), as soon as the screen shows Level 1 is cleared or "Level 2" appears, STOP calling any tools immediately and send your final completion message!';
                 systemPrompt = systemPrompt.isEmpty
                     ? agentImageInstruction
                     : '$systemPrompt\n\n$agentImageInstruction';
