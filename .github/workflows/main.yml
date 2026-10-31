@@ -35,30 +35,43 @@ jobs:
 
       - name: Auto-Apply Clean Automation Files & Fix SDK Version
         run: |
-          # 1. Fix pubspec.yaml SDK constraint and replace experimental null-aware map elements (?system)
-          sed -i 's/sdk: .*/sdk: ">=3.7.0 <4.0.0"/g' pubspec.yaml
+          # 0. If files are nested inside PocketStrike-main/, move them to repo root
+          if [ ! -f pubspec.yaml ] && [ -f PocketStrike-main/pubspec.yaml ]; then
+            shopt -s dotglob
+            mv PocketStrike-main/* .
+            rmdir PocketStrike-main || true
+          fi
+
+          # 1. Fix pubspec.yaml: ensure flutter and flutter_test keep 'sdk: flutter', and environment uses '>=3.5.0 <4.0.0'
+          sed -i '/environment:/,+1 s/sdk:.*/sdk: ">=3.5.0 <4.0.0"/' pubspec.yaml
+          sed -i '/flutter:/,+1 s/sdk:.*/sdk: flutter/' pubspec.yaml
+          sed -i '/flutter_test:/,+1 s/sdk:.*/sdk: flutter/' pubspec.yaml
+
+          # 2. Replace experimental null-aware map element (?system) in anthropic_provider.dart
           if [ -f lib/features/providers/data/anthropic_provider.dart ]; then
             sed -i "s/'system': ?system,/if (system != null) 'system': system,/g" lib/features/providers/data/anthropic_provider.dart
           fi
 
-          # 2. Ensure compileSdk is available
+          # 3. Ensure compileSdk and Gradle memory are safe on GitHub Actions
           if [ -f android/app/build.gradle.kts ]; then
             if ! "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --list_installed | grep -q "platforms;android-37"; then
               sed -i 's/compileSdk = 37/compileSdk = 36/g' android/app/build.gradle.kts
             fi
           fi
+          if [ -f android/gradle.properties ]; then
+            sed -i 's/-Xmx8G -XX:MaxMetaspaceSize=4G/-Xmx4G -XX:MaxMetaspaceSize=2G/g' android/gradle.properties
+          fi
 
-          # 3. Strip any accidental markdown code fences (```) across all Dart, Kotlin, and XML files
-          find lib android -type f \( -name "*.dart" -o -name "*.kt" -o -name "*.xml" \) -exec sed -i "/^[[:space:]]*\`\`\`/d" {} +
+          # 4. Strip any accidental markdown code fences (```) across all Dart, Kotlin, and XML files
+          find lib android -type f \( -name "*.dart" -o -name "*.kt" -o -name "*.xml" \) -exec sed -i '/^[[:space:]]*```/d' {} +
 
-          # 3b. Clean chat_controller.dart and enable Local agent tools
+          # 5. Clean chat_controller.dart and enable Local agent tools
           if [ -f lib/features/chat/application/chat_controller.dart ]; then
-            sed -i '/^[[:space:]]*```/d' lib/features/chat/application/chat_controller.dart
             sed -i 's/if (state\.agentMode || state\.localMode) {{/if (state.agentMode || state.localMode) {/g' lib/features/chat/application/chat_controller.dart
             sed -i 's/if (state\.agentMode) {/if (state.agentMode || state.localMode) {/g' lib/features/chat/application/chat_controller.dart
           fi
 
-          # 4. Write clean accessibility_service_config.xml
+          # 6. Write clean accessibility_service_config.xml
           mkdir -p android/app/src/main/res/xml
           cat << 'EOF_ACC_XML' > android/app/src/main/res/xml/accessibility_service_config.xml
           <?xml version="1.0" encoding="utf-8"?>
@@ -71,7 +84,7 @@ jobs:
               android:notificationTimeout="100" />
           EOF_ACC_XML
 
-          # 5. Write clean PocketStrikeAccessibilityService.kt
+          # 7. Write clean PocketStrikeAccessibilityService.kt
           mkdir -p android/app/src/main/kotlin/com/pocketstrike/pocketstrike
           cat << 'EOF_ACC_KT' > android/app/src/main/kotlin/com/pocketstrike/pocketstrike/PocketStrikeAccessibilityService.kt
           package com.pocketstrike.pocketstrike
@@ -313,7 +326,7 @@ jobs:
           }
           EOF_ACC_KT
 
-          # 6. Write clean MainActivity.kt
+          # 8. Write clean MainActivity.kt
           cat << 'EOF_MAIN_KT' > android/app/src/main/kotlin/com/pocketstrike/pocketstrike/MainActivity.kt
           package com.pocketstrike.pocketstrike
 
@@ -334,7 +347,7 @@ jobs:
           import java.util.concurrent.Executors
 
           class MainActivity : FlutterActivity() {
-              private val MEDIA_CHANNEL = "com.pocketstrike/media"
+              private val CHANNEL = "com.pocketstrike.app/gallery"
               private val AUTOMATION_CHANNEL = "com.pocketstrike/automation"
               private val automationExecutor = Executors.newSingleThreadExecutor()
 
@@ -364,73 +377,116 @@ jobs:
               override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
                   super.configureFlutterEngine(flutterEngine)
 
-                  // 1. Original Media Channel
-                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, MEDIA_CHANNEL)
-                      .setMethodCallHandler { call, result ->
-                          when (call.method) {
-                              "saveImageToGallery" -> {
-                                  val bytes = call.argument<ByteArray>("bytes")
-                                  val fileName = call.argument<String>("fileName")
-                                      ?: "pocketstrike_${System.currentTimeMillis()}.jpg"
-                                  if (bytes != null) {
-                                      val path = saveImageToMediaStore(bytes, fileName)
-                                      if (path != null) {
-                                          result.success(path)
-                                      } else {
-                                          result.error("SAVE_FAILED", "Failed to save image to gallery", null)
-                                      }
-                                  } else {
-                                      result.error("INVALID_ARGS", "Image bytes are null", null)
-                                  }
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "saveImageToGallery" -> {
+                              val bytes = call.argument<ByteArray>("bytes")
+                              val fileName = call.argument<String>("fileName") ?: "PocketStrike_${System.currentTimeMillis()}.jpg"
+
+                              if (bytes == null || bytes.isEmpty()) {
+                                  result.error("INVALID_DATA", "Image bytes cannot be empty", null)
+                                  return@setMethodCallHandler
                               }
-                              "saveFileToDownloads" -> {
-                                  val bytes = call.argument<ByteArray>("bytes")
-                                  val fileName = call.argument<String>("fileName")
-                                      ?: "download_${System.currentTimeMillis()}"
-                                  if (bytes != null) {
-                                      try {
-                                          val downloadsDir = Environment.getExternalStoragePublicDirectory(
-                                              Environment.DIRECTORY_DOWNLOADS
-                                          )
-                                          if (!downloadsDir.exists()) downloadsDir.mkdirs()
-                                          val destFile = File(downloadsDir, fileName)
-                                          FileOutputStream(destFile).use { fos ->
-                                              fos.write(bytes)
-                                              fos.flush()
-                                          }
-                                          MediaScannerConnection.scanFile(
-                                              applicationContext,
-                                              arrayOf(destFile.absolutePath),
-                                              null,
-                                              null
-                                          )
-                                          result.success(destFile.absolutePath)
-                                      } catch (e: Exception) {
-                                          result.error("SAVE_FAILED", e.message, null)
-                                      }
+
+                              try {
+                                  val savedUri = saveImageToMediaStore(bytes, fileName)
+                                  if (savedUri != null) {
+                                      result.success(savedUri)
                                   } else {
-                                      result.error("INVALID_ARGS", "File bytes are null", null)
+                                      result.error("SAVE_FAILED", "Failed to save image to MediaStore", null)
                                   }
+                              } catch (e: Exception) {
+                                  result.error("EXCEPTION", e.localizedMessage ?: "Unknown error", null)
                               }
-                              "deleteFileAtPath" -> {
-                                  val path = call.argument<String>("path")
-                                  if (path != null) {
-                                      val file = File(path)
+                          }
+                          "shareImage" -> {
+                              val filePath = call.argument<String>("filePath")
+                              val text = call.argument<String>("text") ?: "Created with PocketStrike AI"
+                              if (filePath != null) {
+                                  try {
+                                      val file = File(filePath)
                                       if (file.exists()) {
-                                          val deleted = file.delete()
-                                          result.success(deleted)
-                                      } else {
+                                          val uri = androidx.core.content.FileProvider.getUriForFile(
+                                              applicationContext,
+                                              "${applicationContext.packageName}.fileprovider",
+                                              file
+                                          )
+                                          val intent = Intent(Intent.ACTION_SEND).apply {
+                                              type = "image/jpeg"
+                                              putExtra(Intent.EXTRA_STREAM, uri)
+                                              putExtra(Intent.EXTRA_TEXT, text)
+                                              addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                          }
+                                          val chooser = Intent.createChooser(intent, "Share AI Image via").apply {
+                                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                          }
+                                          applicationContext.startActivity(chooser)
                                           result.success(true)
+                                      } else {
+                                          result.error("FILE_NOT_FOUND", "File does not exist: $filePath", null)
                                       }
-                                  } else {
-                                      result.error("INVALID_PATH", "File path is null", null)
+                                  } catch (e: Exception) {
+                                      result.error("EXCEPTION", e.localizedMessage ?: "Unknown error", null)
                                   }
+                              } else {
+                                  result.error("INVALID_PATH", "File path is null", null)
                               }
-                              else -> result.notImplemented()
+                          }
+                          "deleteFromMediaStore" -> {
+                              val filePath = call.argument<String>("filePath")
+                              val fileName = call.argument<String>("fileName")
+                              try {
+                                  if (filePath != null) {
+                                      val file = File(filePath)
+                                      if (file.exists()) {
+                                          file.delete()
+                                      }
+                                  }
+                                  if (fileName != null) {
+                                      val resolver = applicationContext.contentResolver
+                                      val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                          MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                                      } else {
+                                          MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                                      }
+                                      val where = "${MediaStore.Images.Media.DISPLAY_NAME} = ?"
+                                      val args = arrayOf(fileName)
+                                      resolver.delete(collection, where, args)
+                                  }
+                                  if (filePath != null) {
+                                      MediaScannerConnection.scanFile(
+                                          applicationContext,
+                                          arrayOf(filePath),
+                                          arrayOf("image/jpeg", "image/png"),
+                                          null
+                                      )
+                                  }
+                                  result.success(true)
+                              } catch (e: Exception) {
+                                  result.error("EXCEPTION", e.localizedMessage ?: "Unknown error", null)
+                              }
+                          }
+                          "scanFilePath" -> {
+                              val filePath = call.argument<String>("filePath")
+                              if (filePath != null) {
+                                  MediaScannerConnection.scanFile(
+                                      applicationContext,
+                                      arrayOf(filePath),
+                                      arrayOf("image/jpeg", "image/png"),
+                                      null
+                                  )
+                                  result.success(true)
+                              } else {
+                                  result.error("INVALID_PATH", "File path is null", null)
+                              }
+                          }
+                          else -> {
+                              result.notImplemented()
                           }
                       }
+                  }
 
-                  // 2. UI & App Automation Channel
                   MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AUTOMATION_CHANNEL)
                       .setMethodCallHandler { call, result ->
                           automationExecutor.execute {
@@ -615,10 +671,7 @@ jobs:
                       put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
                       put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
                       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                          put(
-                              MediaStore.Images.Media.RELATIVE_PATH,
-                              Environment.DIRECTORY_PICTURES + "/PocketStrike"
-                          )
+                          put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/PocketStrike")
                           put(MediaStore.Images.Media.IS_PENDING, 1)
                       }
                   }
@@ -646,10 +699,7 @@ jobs:
                       return imageUri.toString()
                   }
 
-                  val picturesDir = File(
-                      Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
-                      "PocketStrike"
-                  )
+                  val picturesDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "PocketStrike")
                   if (!picturesDir.exists()) {
                       picturesDir.mkdirs()
                   }
@@ -669,7 +719,7 @@ jobs:
           }
           EOF_MAIN_KT
 
-          # 7. Write clean AndroidManifest.xml
+          # 9. Write clean AndroidManifest.xml
           cat << 'EOF_MANIFEST' > android/app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET"/>
@@ -774,7 +824,7 @@ jobs:
           </manifest>
           EOF_MANIFEST
 
-          # 8. Write clean android_automation_tools.dart
+          # 10. Write clean android_automation_tools.dart
           mkdir -p lib/features/agent/data
           cat << 'EOF_AUTO_DART' > lib/features/agent/data/android_automation_tools.dart
           import 'dart:io';
@@ -1165,33 +1215,43 @@ jobs:
           }
           EOF_AUTO_DART
 
-          # 9. Write clean agent_tools_screen.dart
+          # 11. Write clean agent_tools_screen.dart
           mkdir -p lib/features/settings/ui
           cat << 'EOF_SCREEN_DART' > lib/features/settings/ui/agent_tools_screen.dart
           import 'package:flutter/material.dart';
           import 'package:flutter/services.dart';
+          import 'package:flutter_riverpod/flutter_riverpod.dart';
+          import 'package:pocketstrike/app/theme/glass_tokens.dart';
+          import 'package:pocketstrike/core/storage/prefs_provider.dart';
+          import 'package:pocketstrike/shared/widgets/app_icons.dart';
 
-          class AgentToolsScreen extends StatefulWidget {
+          class AgentToolsScreen extends ConsumerStatefulWidget {
             const AgentToolsScreen({super.key});
 
             @override
-            State<AgentToolsScreen> createState() => _AgentToolsScreenState();
+            ConsumerState<AgentToolsScreen> createState() => _AgentToolsScreenState();
           }
 
-          class _AgentToolsScreenState extends State<AgentToolsScreen> {
+          class _AgentToolsScreenState extends ConsumerState<AgentToolsScreen> {
             static const MethodChannel _automationChannel =
                 MethodChannel('com.pocketstrike/automation');
 
-            bool _enableUiAutomation = true;
             bool _enableFilesystem = true;
             bool _enableWebSearch = true;
             bool _enableCalculator = true;
             bool _enableCodeSandbox = true;
+            bool _enableUiAutomation = true;
             bool _isAccessibilityGranted = false;
 
             @override
             void initState() {
               super.initState();
+              final prefs = ref.read(sharedPreferencesProvider);
+              _enableFilesystem = prefs.getBool('tool_filesystem') ?? true;
+              _enableWebSearch = prefs.getBool('tool_websearch') ?? true;
+              _enableCalculator = prefs.getBool('tool_calculator') ?? true;
+              _enableCodeSandbox = prefs.getBool('tool_codesandbox') ?? true;
+              _enableUiAutomation = prefs.getBool('tool_ui_automation') ?? true;
               _checkAccessibilityStatus();
             }
 
@@ -1211,14 +1271,23 @@ jobs:
               } catch (_) {}
             }
 
+            Future<void> _update(String key, bool value) async {
+              final prefs = ref.read(sharedPreferencesProvider);
+              await prefs.setBool(key, value);
+            }
+
             @override
             Widget build(BuildContext context) {
+              final tokens = context.glass;
               return Scaffold(
                 appBar: AppBar(
-                  title: const Text('Agent Tools & Capabilities'),
+                  title: Text(
+                    'Agent Tools & Capabilities',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
                   actions: [
                     IconButton(
-                      icon: const Icon(Icons.refresh),
+                      icon: const Icon(AppIcons.rotateCcw),
                       tooltip: 'Refresh Accessibility Status',
                       onPressed: _checkAccessibilityStatus,
                     ),
@@ -1227,65 +1296,93 @@ jobs:
                 body: ListView(
                   padding: const EdgeInsets.all(16),
                   children: [
-                    _ToolSwitchCard(
-                      icon: Icons.touch_app_outlined,
+                    _ToolSwitchTile(
+                      icon: AppIcons.smartphone,
                       title: 'Phone UI & App Control',
                       subtitle:
                           'open_app, click_element, tap_screen, type_text, swipe_screen, get_screen_elements',
                       value: _enableUiAutomation,
-                      onChanged: (v) => setState(() => _enableUiAutomation = v),
+                      onChanged: (v) {
+                        setState(() => _enableUiAutomation = v);
+                        _update('tool_ui_automation', v);
+                      },
                     ),
-                    Card(
-                      margin: const EdgeInsets.only(bottom: 12),
-                      child: ListTile(
-                        leading: Icon(
-                          _isAccessibilityGranted
-                              ? Icons.check_circle_outline
-                              : Icons.warning_amber_rounded,
-                          color: _isAccessibilityGranted ? Colors.green : Colors.orange,
-                        ),
-                        title: Text(
-                          _isAccessibilityGranted
-                              ? 'Accessibility Service Active'
-                              : 'Accessibility Permission Required',
-                        ),
-                        subtitle: const Text(
-                          'Enable PocketStrike UI Automation in Android Accessibility Settings',
-                        ),
-                        trailing: FilledButton.tonal(
-                          onPressed: _openAccessibilitySettings,
-                          child: Text(_isAccessibilityGranted ? 'Settings' : 'Enable'),
-                        ),
+                    Container(
+                      margin: const EdgeInsets.only(bottom: 10),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      decoration: BoxDecoration(
+                        color: tokens.glassColor,
+                        borderRadius: BorderRadius.circular(tokens.radiusSm),
+                        border: Border.all(color: tokens.glassBorder),
+                      ),
+                      child: Row(
+                        children: [
+                          Icon(
+                            _isAccessibilityGranted
+                                ? AppIcons.checkCircle2
+                                : AppIcons.alertCircle,
+                            color: _isAccessibilityGranted
+                                ? Colors.greenAccent
+                                : Colors.orangeAccent,
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              _isAccessibilityGranted
+                                  ? 'Accessibility Service is active (Tap, Type & Swipe ready)'
+                                  : 'Accessibility permission required for Tap, Type & Swipe',
+                              style: TextStyle(color: tokens.textSecondary, fontSize: 13),
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: _openAccessibilitySettings,
+                            child: Text(
+                              _isAccessibilityGranted ? 'Settings' : 'Enable',
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                    _ToolSwitchCard(
-                      icon: Icons.folder_outlined,
+                    _ToolSwitchTile(
+                      icon: AppIcons.folder,
                       title: 'File System Agent Tools',
                       subtitle:
                           'list_files, read_file, write_file, create_folder, delete_file, search_files',
                       value: _enableFilesystem,
-                      onChanged: (v) => setState(() => _enableFilesystem = v),
+                      onChanged: (v) {
+                        setState(() => _enableFilesystem = v);
+                        _update('tool_filesystem', v);
+                      },
                     ),
-                    _ToolSwitchCard(
-                      icon: Icons.public,
+                    _ToolSwitchTile(
+                      icon: AppIcons.globe,
                       title: 'Web Search Tool',
                       subtitle: 'Queries web search endpoint for live information',
                       value: _enableWebSearch,
-                      onChanged: (v) => setState(() => _enableWebSearch = v),
+                      onChanged: (v) {
+                        setState(() => _enableWebSearch = v);
+                        _update('tool_websearch', v);
+                      },
                     ),
-                    _ToolSwitchCard(
-                      icon: Icons.calculate_outlined,
+                    _ToolSwitchTile(
+                      icon: AppIcons.calculator,
                       title: 'Arithmetic Calculator',
                       subtitle: 'Evaluates basic mathematical expressions',
                       value: _enableCalculator,
-                      onChanged: (v) => setState(() => _enableCalculator = v),
+                      onChanged: (v) {
+                        setState(() => _enableCalculator = v);
+                        _update('tool_calculator', v);
+                      },
                     ),
-                    _ToolSwitchCard(
-                      icon: Icons.code,
+                    _ToolSwitchTile(
+                      icon: AppIcons.code,
                       title: 'Code Execution Sandbox',
                       subtitle: 'Validates and evaluates safe code snippets',
                       value: _enableCodeSandbox,
-                      onChanged: (v) => setState(() => _enableCodeSandbox = v),
+                      onChanged: (v) {
+                        setState(() => _enableCodeSandbox = v);
+                        _update('tool_codesandbox', v);
+                      },
                     ),
                   ],
                 ),
@@ -1293,8 +1390,8 @@ jobs:
             }
           }
 
-          class _ToolSwitchCard extends StatelessWidget {
-            const _ToolSwitchCard({
+          class _ToolSwitchTile extends StatelessWidget {
+            const _ToolSwitchTile({
               required this.icon,
               required this.title,
               required this.subtitle,
@@ -1310,13 +1407,20 @@ jobs:
 
             @override
             Widget build(BuildContext context) {
-              return Card(
-                margin: const EdgeInsets.only(bottom: 12),
+              final tokens = context.glass;
+              return Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                decoration: BoxDecoration(
+                  color: tokens.glassColor,
+                  borderRadius: BorderRadius.circular(tokens.radiusSm),
+                  border: Border.all(color: tokens.glassBorder),
+                ),
                 child: SwitchListTile(
-                  secondary: Icon(icon, color: Theme.of(context).colorScheme.primary),
-                  title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
-                  subtitle: Text(subtitle),
+                  secondary: Icon(icon, color: tokens.accent),
+                  title: Text(title, style: Theme.of(context).textTheme.titleMedium),
+                  subtitle: Text(subtitle, style: TextStyle(color: tokens.textSecondary)),
                   value: value,
+                  activeThumbColor: tokens.accent,
                   onChanged: onChanged,
                 ),
               );
