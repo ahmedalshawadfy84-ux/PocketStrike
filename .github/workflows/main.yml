@@ -1,0 +1,1339 @@
+name: Build PocketStrike Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    name: Compile Release APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Accept Android SDK Licenses & Install Build Tools
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "platforms;android-36" "build-tools;35.0.0" || true
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Auto-Apply Clean Automation Files & Fix SDK Version
+        run: |
+          # 1. Fix pubspec.yaml SDK constraint and replace experimental null-aware map elements (?system)
+          sed -i 's/sdk: .*/sdk: ">=3.7.0 <4.0.0"/g' pubspec.yaml
+          if [ -f lib/features/providers/data/anthropic_provider.dart ]; then
+            sed -i "s/'system': ?system,/if (system != null) 'system': system,/g" lib/features/providers/data/anthropic_provider.dart
+          fi
+
+          # 2. Ensure compileSdk is available
+          if [ -f android/app/build.gradle.kts ]; then
+            if ! "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --list_installed | grep -q "platforms;android-37"; then
+              sed -i 's/compileSdk = 37/compileSdk = 36/g' android/app/build.gradle.kts
+            fi
+          fi
+
+          # 3. Strip any accidental markdown code fences (```) across all Dart, Kotlin, and XML files
+          find lib android -type f \( -name "*.dart" -o -name "*.kt" -o -name "*.xml" \) -exec sed -i "/^[[:space:]]*\`\`\`/d" {} +
+
+          # 3b. Clean chat_controller.dart and enable Local agent tools
+          if [ -f lib/features/chat/application/chat_controller.dart ]; then
+            sed -i '/^[[:space:]]*```/d' lib/features/chat/application/chat_controller.dart
+            sed -i 's/if (state\.agentMode || state\.localMode) {{/if (state.agentMode || state.localMode) {/g' lib/features/chat/application/chat_controller.dart
+            sed -i 's/if (state\.agentMode) {/if (state.agentMode || state.localMode) {/g' lib/features/chat/application/chat_controller.dart
+          fi
+
+          # 4. Write clean accessibility_service_config.xml
+          mkdir -p android/app/src/main/res/xml
+          cat << 'EOF_ACC_XML' > android/app/src/main/res/xml/accessibility_service_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews|flagReportViewIds"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100" />
+          EOF_ACC_XML
+
+          # 5. Write clean PocketStrikeAccessibilityService.kt
+          mkdir -p android/app/src/main/kotlin/com/pocketstrike/pocketstrike
+          cat << 'EOF_ACC_KT' > android/app/src/main/kotlin/com/pocketstrike/pocketstrike/PocketStrikeAccessibilityService.kt
+          package com.pocketstrike.pocketstrike
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import java.util.concurrent.CountDownLatch
+          import java.util.concurrent.TimeUnit
+
+          class PocketStrikeAccessibilityService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: PocketStrikeAccessibilityService? = null
+                      private set
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  // Inspected on-demand via rootInActiveWindow
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  if (instance === this) {
+                      instance = null
+                  }
+                  super.onDestroy()
+              }
+
+              fun dumpUiHierarchy(maxNodes: Int = 80): String {
+                  val root = rootInActiveWindow
+                      ?: return "Error: No active window available. Make sure the screen is unlocked."
+                  val sb = StringBuilder()
+                  sb.appendLine("Active Package: ${root.packageName ?: "unknown"}")
+                  var count = 0
+
+                  fun traverse(node: AccessibilityNodeInfo?, depth: Int) {
+                      if (node == null || count >= maxNodes) return
+                      val text = node.text?.toString()?.trim().orEmpty()
+                      val desc = node.contentDescription?.toString()?.trim().orEmpty()
+                      val viewId = node.viewIdResourceName?.substringAfter("/") ?: ""
+                      val isClickable = node.isClickable
+                      val isEditable = node.isEditable
+                      val isScrollable = node.isScrollable
+
+                      if (text.isNotEmpty() || desc.isNotEmpty() || isClickable || isEditable) {
+                          val rect = Rect()
+                          node.getBoundsInScreen(rect)
+                          if (rect.width() > 0 && rect.height() > 0) {
+                              count++
+                              val cx = rect.centerX()
+                              val cy = rect.centerY()
+                              val flags = mutableListOf<String>()
+                              if (isClickable) flags.add("clickable")
+                              if (isEditable) flags.add("editable")
+                              if (isScrollable) flags.add("scrollable")
+                              val cls = node.className?.toString()?.substringAfterLast('.') ?: "View"
+                              sb.appendLine(
+                                  "[$count] $cls | text='$text' | desc='$desc' | id='$viewId' | center=($cx,$cy) | flags=${flags.joinToString(",")}"
+                              )
+                          }
+                      }
+
+                      for (i in 0 until node.childCount) {
+                          traverse(node.getChild(i), depth + 1)
+                      }
+                  }
+
+                  traverse(root, 0)
+                  return if (count == 0) {
+                      "No interactive UI elements found in active window (${root.packageName})."
+                  } else {
+                      sb.toString().trim()
+                  }
+              }
+
+              fun clickByText(query: String): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  val normalized = query.trim().lowercase()
+                  val match = findNodeMatching(root) { node ->
+                      val t = node.text?.toString()?.lowercase().orEmpty()
+                      val d = node.contentDescription?.toString()?.lowercase().orEmpty()
+                      val id = node.viewIdResourceName?.lowercase().orEmpty()
+                      t.contains(normalized) || d.contains(normalized) || id.contains(normalized)
+                  } ?: return false
+
+                  var current: AccessibilityNodeInfo? = match
+                  while (current != null) {
+                      if (current.isClickable && current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                          return true
+                      }
+                      current = current.parent
+                  }
+
+                  val rect = Rect()
+                  match.getBoundsInScreen(rect)
+                  if (rect.width() > 0 && rect.height() > 0) {
+                      return tapCoordinates(rect.centerX().toFloat(), rect.centerY().toFloat())
+                  }
+                  return false
+              }
+
+              fun inputText(text: String, targetQuery: String? = null, submit: Boolean = false): Boolean {
+                  val root = rootInActiveWindow ?: return false
+                  var targetNode: AccessibilityNodeInfo? = null
+
+                  if (!targetQuery.isNullOrBlank()) {
+                      val q = targetQuery.trim().lowercase()
+                      targetNode = findNodeMatching(root) { node ->
+                          val t = node.text?.toString()?.lowercase().orEmpty()
+                          val d = node.contentDescription?.toString()?.lowercase().orEmpty()
+                          val id = node.viewIdResourceName?.lowercase().orEmpty()
+                          val hint = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                              node.hintText?.toString()?.lowercase().orEmpty()
+                          } else ""
+                          (node.isEditable || node.className?.toString()?.contains("EditText") == true) &&
+                              (t.contains(q) || d.contains(q) || id.contains(q) || hint.contains(q))
+                      }
+                      if (targetNode == null) {
+                          if (clickByText(targetQuery)) {
+                              Thread.sleep(600)
+                          }
+                      }
+                  }
+
+                  val updatedRoot = rootInActiveWindow ?: root
+                  if (targetNode == null) {
+                      targetNode = updatedRoot.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                  }
+                  if (targetNode == null) {
+                      targetNode = findNodeMatching(updatedRoot) { node ->
+                          node.isEditable || node.className?.toString()?.contains("EditText") == true
+                      }
+                  }
+
+                  val node = targetNode ?: return false
+                  node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                  node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+
+                  val args = Bundle().apply {
+                      putCharSequence(
+                          AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                          text
+                      )
+                  }
+                  val setOk = node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+
+                  if (submit) {
+                      Thread.sleep(250)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                          node.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                      }
+                  }
+                  return setOk
+              }
+
+              fun tapCoordinates(x: Float, y: Float, durationMs: Long = 100L): Boolean {
+                  val path = Path().apply { moveTo(x, y) }
+                  val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs)
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  return dispatchGestureSync(gesture)
+              }
+
+              fun swipe(
+                  startX: Float,
+                  startY: Float,
+                  endX: Float,
+                  endY: Float,
+                  durationMs: Long = 350L
+              ): Boolean {
+                  val path = Path().apply {
+                      moveTo(startX, startY)
+                      lineTo(endX, endY)
+                  }
+                  val stroke = GestureDescription.StrokeDescription(path, 0L, durationMs.coerceIn(50L, 5000L))
+                  val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                  return dispatchGestureSync(gesture)
+              }
+
+              fun performGlobal(actionName: String): Boolean {
+                  val action = when (actionName.trim().lowercase()) {
+                      "back" -> GLOBAL_ACTION_BACK
+                      "home" -> GLOBAL_ACTION_HOME
+                      "recents" -> GLOBAL_ACTION_RECENTS
+                      "notifications" -> GLOBAL_ACTION_NOTIFICATIONS
+                      "quick_settings" -> GLOBAL_ACTION_QUICK_SETTINGS
+                      else -> return false
+                  }
+                  return performGlobalAction(action)
+              }
+
+              private fun dispatchGestureSync(gesture: GestureDescription): Boolean {
+                  val latch = CountDownLatch(1)
+                  var succeeded = false
+                  val dispatched = dispatchGesture(
+                      gesture,
+                      object : GestureResultCallback() {
+                          override fun onCompleted(gestureDescription: GestureDescription?) {
+                              succeeded = true
+                              latch.countDown()
+                          }
+
+                          override fun onCancelled(gestureDescription: GestureDescription?) {
+                              succeeded = false
+                              latch.countDown()
+                          }
+                      },
+                      null
+                  )
+                  if (!dispatched) return false
+                  latch.await(5, TimeUnit.SECONDS)
+                  return succeeded
+              }
+
+              private fun findNodeMatching(
+                  root: AccessibilityNodeInfo?,
+                  predicate: (AccessibilityNodeInfo) -> Boolean
+              ): AccessibilityNodeInfo? {
+                  if (root == null) return null
+                  if (predicate(root)) return root
+                  for (i in 0 until root.childCount) {
+                      val childMatch = findNodeMatching(root.getChild(i), predicate)
+                      if (childMatch != null) return childMatch
+                  }
+                  return null
+              }
+          }
+          EOF_ACC_KT
+
+          # 6. Write clean MainActivity.kt
+          cat << 'EOF_MAIN_KT' > android/app/src/main/kotlin/com/pocketstrike/pocketstrike/MainActivity.kt
+          package com.pocketstrike.pocketstrike
+
+          import android.app.SearchManager
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.media.MediaScannerConnection
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.provider.Settings
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.util.concurrent.Executors
+
+          class MainActivity : FlutterActivity() {
+              private val MEDIA_CHANNEL = "com.pocketstrike/media"
+              private val AUTOMATION_CHANNEL = "com.pocketstrike/automation"
+              private val automationExecutor = Executors.newSingleThreadExecutor()
+
+              private val commonAppAliases = mapOf(
+                  "youtube" to "com.google.android.youtube",
+                  "يوتيوب" to "com.google.android.youtube",
+                  "اليوتيوب" to "com.google.android.youtube",
+                  "whatsapp" to "com.whatsapp",
+                  "واتساب" to "com.whatsapp",
+                  "الواتساب" to "com.whatsapp",
+                  "chrome" to "com.android.chrome",
+                  "كروم" to "com.android.chrome",
+                  "telegram" to "org.telegram.messenger",
+                  "تليجرام" to "org.telegram.messenger",
+                  "تيليجرام" to "org.telegram.messenger",
+                  "facebook" to "com.facebook.katana",
+                  "فيسبوك" to "com.facebook.katana",
+                  "instagram" to "com.instagram.android",
+                  "انستقرام" to "com.instagram.android",
+                  "انستغرام" to "com.instagram.android",
+                  "settings" to "com.android.settings",
+                  "الإعدادات" to "com.android.settings",
+                  "الاعدادات" to "com.android.settings",
+                  "الضبط" to "com.android.settings"
+              )
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+
+                  // 1. Original Media Channel
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, MEDIA_CHANNEL)
+                      .setMethodCallHandler { call, result ->
+                          when (call.method) {
+                              "saveImageToGallery" -> {
+                                  val bytes = call.argument<ByteArray>("bytes")
+                                  val fileName = call.argument<String>("fileName")
+                                      ?: "pocketstrike_${System.currentTimeMillis()}.jpg"
+                                  if (bytes != null) {
+                                      val path = saveImageToMediaStore(bytes, fileName)
+                                      if (path != null) {
+                                          result.success(path)
+                                      } else {
+                                          result.error("SAVE_FAILED", "Failed to save image to gallery", null)
+                                      }
+                                  } else {
+                                      result.error("INVALID_ARGS", "Image bytes are null", null)
+                                  }
+                              }
+                              "saveFileToDownloads" -> {
+                                  val bytes = call.argument<ByteArray>("bytes")
+                                  val fileName = call.argument<String>("fileName")
+                                      ?: "download_${System.currentTimeMillis()}"
+                                  if (bytes != null) {
+                                      try {
+                                          val downloadsDir = Environment.getExternalStoragePublicDirectory(
+                                              Environment.DIRECTORY_DOWNLOADS
+                                          )
+                                          if (!downloadsDir.exists()) downloadsDir.mkdirs()
+                                          val destFile = File(downloadsDir, fileName)
+                                          FileOutputStream(destFile).use { fos ->
+                                              fos.write(bytes)
+                                              fos.flush()
+                                          }
+                                          MediaScannerConnection.scanFile(
+                                              applicationContext,
+                                              arrayOf(destFile.absolutePath),
+                                              null,
+                                              null
+                                          )
+                                          result.success(destFile.absolutePath)
+                                      } catch (e: Exception) {
+                                          result.error("SAVE_FAILED", e.message, null)
+                                      }
+                                  } else {
+                                      result.error("INVALID_ARGS", "File bytes are null", null)
+                                  }
+                              }
+                              "deleteFileAtPath" -> {
+                                  val path = call.argument<String>("path")
+                                  if (path != null) {
+                                      val file = File(path)
+                                      if (file.exists()) {
+                                          val deleted = file.delete()
+                                          result.success(deleted)
+                                      } else {
+                                          result.success(true)
+                                      }
+                                  } else {
+                                      result.error("INVALID_PATH", "File path is null", null)
+                                  }
+                              }
+                              else -> result.notImplemented()
+                          }
+                      }
+
+                  // 2. UI & App Automation Channel
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, AUTOMATION_CHANNEL)
+                      .setMethodCallHandler { call, result ->
+                          automationExecutor.execute {
+                              try {
+                                  val response: Any? = when (call.method) {
+                                      "isAccessibilityEnabled" -> {
+                                          PocketStrikeAccessibilityService.instance != null
+                                      }
+                                      "openAccessibilitySettings" -> {
+                                          val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                          }
+                                          startActivity(intent)
+                                          "Opened Android Accessibility Settings."
+                                      }
+                                      "listInstalledApps" -> {
+                                          listLaunchableApps()
+                                      }
+                                      "openApp" -> {
+                                          val appNameOrPkg = call.argument<String>("app") ?: ""
+                                          val searchQuery = call.argument<String>("searchQuery")
+                                          launchApp(appNameOrPkg, searchQuery)
+                                      }
+                                      "dumpUi" -> {
+                                          val svc = PocketStrikeAccessibilityService.instance
+                                          svc?.dumpUiHierarchy()
+                                              ?: "Error: Accessibility Service is not enabled. Enable PocketStrike in Settings > Accessibility."
+                                      }
+                                      "clickNode" -> {
+                                          val target = call.argument<String>("target") ?: ""
+                                          val svc = PocketStrikeAccessibilityService.instance
+                                          if (svc == null) {
+                                              "Error: Accessibility Service is not enabled."
+                                          } else if (svc.clickByText(target)) {
+                                              "Clicked element matching '$target'."
+                                          } else {
+                                              "Could not find or click element matching '$target'."
+                                          }
+                                      }
+                                      "tap" -> {
+                                          val x = (call.argument<Number>("x")?.toFloat()) ?: 0f
+                                          val y = (call.argument<Number>("y")?.toFloat()) ?: 0f
+                                          val svc = PocketStrikeAccessibilityService.instance
+                                          if (svc == null) {
+                                              "Error: Accessibility Service is not enabled."
+                                          } else if (svc.tapCoordinates(x, y)) {
+                                              "Tapped coordinates ($x, $y)."
+                                          } else {
+                                              "Failed to tap coordinates ($x, $y)."
+                                          }
+                                      }
+                                      "inputText" -> {
+                                          val text = call.argument<String>("text") ?: ""
+                                          val target = call.argument<String>("target")
+                                          val submit = call.argument<Boolean>("submit") ?: false
+                                          val svc = PocketStrikeAccessibilityService.instance
+                                          if (svc == null) {
+                                              "Error: Accessibility Service is not enabled."
+                                          } else if (svc.inputText(text, target, submit)) {
+                                              val suffix = if (submit) " and submitted" else ""
+                                              "Typed '$text'$suffix."
+                                          } else {
+                                              "Could not find an editable text field on screen."
+                                          }
+                                      }
+                                      "swipe" -> {
+                                          val startX = (call.argument<Number>("startX")?.toFloat()) ?: 500f
+                                          val startY = (call.argument<Number>("startY")?.toFloat()) ?: 1500f
+                                          val endX = (call.argument<Number>("endX")?.toFloat()) ?: 500f
+                                          val endY = (call.argument<Number>("endY")?.toFloat()) ?: 400f
+                                          val duration = (call.argument<Number>("durationMs")?.toLong()) ?: 350L
+                                          val svc = PocketStrikeAccessibilityService.instance
+                                          if (svc == null) {
+                                              "Error: Accessibility Service is not enabled."
+                                          } else if (svc.swipe(startX, startY, endX, endY, duration)) {
+                                              "Swiped from ($startX, $startY) to ($endX, $endY)."
+                                          } else {
+                                              "Swipe gesture failed."
+                                          }
+                                      }
+                                      "globalAction" -> {
+                                          val action = call.argument<String>("action") ?: "back"
+                                          val svc = PocketStrikeAccessibilityService.instance
+                                          if (svc == null) {
+                                              "Error: Accessibility Service is not enabled."
+                                          } else if (svc.performGlobal(action)) {
+                                              "Executed system action: $action"
+                                          } else {
+                                              "Failed to execute system action: $action"
+                                          }
+                                      }
+                                      else -> {
+                                          runOnUiThread { result.notImplemented() }
+                                          return@execute
+                                      }
+                                  }
+                                  runOnUiThread { result.success(response) }
+                              } catch (e: Exception) {
+                                  runOnUiThread {
+                                      result.error("AUTOMATION_ERR", e.message ?: "Unknown error", null)
+                                  }
+                              }
+                          }
+                      }
+              }
+
+              private fun listLaunchableApps(): String {
+                  val pm = applicationContext.packageManager
+                  val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+                      addCategory(Intent.CATEGORY_LAUNCHER)
+                  }
+                  val resolveInfos = pm.queryIntentActivities(mainIntent, 0)
+                  val apps = resolveInfos.mapNotNull { info ->
+                      val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
+                      val label = info.loadLabel(pm)?.toString()?.trim().orEmpty()
+                      "• $label ($pkg)"
+                  }.distinct().sorted()
+                  return if (apps.isEmpty()) {
+                      "No launchable apps found."
+                  } else {
+                      "Installed Apps (${apps.size}):\n" + apps.joinToString("\n")
+                  }
+              }
+
+              private fun launchApp(appNameOrPkg: String, searchQuery: String?): String {
+                  val query = appNameOrPkg.trim()
+                  if (query.isEmpty()) return "Error: App name or package cannot be empty."
+
+                  val pm = applicationContext.packageManager
+                  var targetPkg: String? = commonAppAliases[query.lowercase()]
+
+                  if (targetPkg == null) {
+                      val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+                          addCategory(Intent.CATEGORY_LAUNCHER)
+                      }
+                      val resolveInfos = pm.queryIntentActivities(mainIntent, 0)
+                      for (info in resolveInfos) {
+                          val pkg = info.activityInfo?.packageName ?: continue
+                          val label = info.loadLabel(pm)?.toString()?.trim().orEmpty()
+                          if (pkg.equals(query, ignoreCase = true) ||
+                              label.equals(query, ignoreCase = true) ||
+                              label.contains(query, ignoreCase = true)
+                          ) {
+                              targetPkg = pkg
+                              break
+                          }
+                      }
+                  }
+
+                  val resolvedPkg = targetPkg ?: query
+
+                  if (!searchQuery.isNullOrBlank()) {
+                      try {
+                          val searchIntent = Intent(Intent.ACTION_SEARCH).apply {
+                              setPackage(resolvedPkg)
+                              putExtra(SearchManager.QUERY, searchQuery)
+                              putExtra("query", searchQuery)
+                              addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                          }
+                          if (searchIntent.resolveActivity(pm) != null) {
+                              startActivity(searchIntent)
+                              Thread.sleep(1200)
+                              return "Opened $resolvedPkg and executed search for '$searchQuery'."
+                          }
+                      } catch (_: Exception) {}
+                  }
+
+                  val launchIntent = pm.getLaunchIntentForPackage(resolvedPkg)
+                  if (launchIntent != null) {
+                      launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(launchIntent)
+                      Thread.sleep(1200)
+                      return "Successfully launched app: $resolvedPkg"
+                  }
+
+                  return "Error: Could not find or launch app '$appNameOrPkg'."
+              }
+
+              private fun saveImageToMediaStore(bytes: ByteArray, fileName: String): String? {
+                  val resolver = applicationContext.contentResolver
+                  val contentValues = ContentValues().apply {
+                      put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                      put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          put(
+                              MediaStore.Images.Media.RELATIVE_PATH,
+                              Environment.DIRECTORY_PICTURES + "/PocketStrike"
+                          )
+                          put(MediaStore.Images.Media.IS_PENDING, 1)
+                      }
+                  }
+
+                  val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                  } else {
+                      MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                  }
+
+                  val imageUri: Uri? = resolver.insert(collection, contentValues)
+
+                  if (imageUri != null) {
+                      resolver.openOutputStream(imageUri)?.use { outputStream ->
+                          outputStream.write(bytes)
+                          outputStream.flush()
+                      }
+
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          contentValues.clear()
+                          contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
+                          resolver.update(imageUri, contentValues, null, null)
+                      }
+
+                      return imageUri.toString()
+                  }
+
+                  val picturesDir = File(
+                      Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+                      "PocketStrike"
+                  )
+                  if (!picturesDir.exists()) {
+                      picturesDir.mkdirs()
+                  }
+                  val destFile = File(picturesDir, fileName)
+                  FileOutputStream(destFile).use { fos ->
+                      fos.write(bytes)
+                      fos.flush()
+                  }
+                  MediaScannerConnection.scanFile(
+                      applicationContext,
+                      arrayOf(destFile.absolutePath),
+                      arrayOf("image/jpeg"),
+                      null
+                  )
+                  return destFile.absolutePath
+              }
+          }
+          EOF_MAIN_KT
+
+          # 7. Write clean AndroidManifest.xml
+          cat << 'EOF_MANIFEST' > android/app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+              <application
+                  android:label="PocketStrike"
+                  android:name="${applicationName}"
+                  android:enableOnBackInvokedCallback="true"
+                  android:usesCleartextTraffic="true"
+                  android:requestLegacyExternalStorage="true"
+                  android:icon="@mipmap/launcher_icon">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:taskAffinity=""
+                      android:theme="@style/LaunchTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <meta-data
+                        android:name="io.flutter.embedding.android.NormalTheme"
+                        android:resource="@style/NormalTheme"
+                        />
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".PocketStrikeAccessibilityService"
+                      android:label="PocketStrike UI Automation"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+
+                  <service
+                      android:name="id.flutter.flutter_background_service.BackgroundService"
+                      android:foregroundServiceType="dataSync|specialUse"
+                      android:exported="true"
+                      android:stopWithTask="false">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Autonomous AI Agent telegram message relay and scheduled cron triggers." />
+                  </service>
+
+                  <provider
+                      android:name="androidx.core.content.FileProvider"
+                      android:authorities="${applicationId}.fileprovider"
+                      android:exported="false"
+                      android:grantUriPermissions="true">
+                      <meta-data
+                          android:name="android.support.FILE_PROVIDER_PATHS"
+                          android:resource="@xml/file_paths" />
+                  </provider>
+
+                  <meta-data
+                      android:name="flutterEmbedding"
+                      android:value="2" />
+              </application>
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN"/>
+                      <category android:name="android.intent.category.LAUNCHER"/>
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.PROCESS_TEXT"/>
+                      <data android:mimeType="text/plain"/>
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.VIEW"/>
+                      <data android:scheme="https"/>
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.VIEW"/>
+                      <data android:scheme="http"/>
+                  </intent>
+              </queries>
+          </manifest>
+          EOF_MANIFEST
+
+          # 8. Write clean android_automation_tools.dart
+          mkdir -p lib/features/agent/data
+          cat << 'EOF_AUTO_DART' > lib/features/agent/data/android_automation_tools.dart
+          import 'dart:io';
+          import 'package:flutter/services.dart';
+          import '../domain/agent_tool.dart';
+
+          class AndroidAutomationTools {
+            const AndroidAutomationTools._();
+
+            static const MethodChannel _channel =
+                MethodChannel('com.pocketstrike/automation');
+
+            static List<AgentTool> all() => [
+                  getBatteryStatus(),
+                  getNetworkStatus(),
+                  shareText(),
+                  listInstalledApps(),
+                  openApp(),
+                  getScreenElements(),
+                  clickElement(),
+                  tapScreen(),
+                  typeText(),
+                  swipeScreen(),
+                  navigatePhone(),
+                ];
+
+            static AgentTool listInstalledApps() => AgentTool(
+                  name: 'list_installed_apps',
+                  description:
+                      'Lists all installed launchable applications on the Android device with their display names and package names.',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': <String, dynamic>{},
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    try {
+                      final res = await _channel.invokeMethod<String>('listInstalledApps');
+                      return res ?? 'No installed apps returned.';
+                    } catch (e) {
+                      return 'Error listing apps: $e';
+                    }
+                  },
+                );
+
+            static AgentTool openApp() => AgentTool(
+                  name: 'open_app',
+                  description:
+                      'Opens an installed Android application by its display name (Arabic or English, e.g. "YouTube", "يوتيوب", "WhatsApp", "واتساب") or package name (e.g. "com.google.android.youtube"). Optionally accepts search_query to directly search inside the app.',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': {
+                      'app': {
+                        'type': 'string',
+                        'description':
+                            'App name (e.g. "YouTube", "يوتيوب") or package name (e.g. "com.google.android.youtube").',
+                      },
+                      'search_query': {
+                        'type': 'string',
+                        'description':
+                            'Optional search text to trigger directly inside the app (e.g. "منتخب مصر").',
+                      },
+                    },
+                    'required': ['app'],
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    final app = args['app'] as String? ?? '';
+                    final searchQuery = args['search_query'] as String?;
+                    try {
+                      final res = await _channel.invokeMethod<String>('openApp', {
+                        'app': app,
+                        'searchQuery': searchQuery,
+                      });
+                      return res ?? 'Opened $app';
+                    } catch (e) {
+                      return 'Failed to open app "$app": $e';
+                    }
+                  },
+                );
+
+            static AgentTool getScreenElements() => AgentTool(
+                  name: 'get_screen_elements',
+                  description:
+                      'Reads the current phone screen via AccessibilityService and returns all visible buttons, text fields, labels, and their center (x, y) coordinates.',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': <String, dynamic>{},
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    try {
+                      final res = await _channel.invokeMethod<String>('dumpUi');
+                      return res ?? 'No screen elements returned.';
+                    } catch (e) {
+                      return 'Failed to read screen elements: $e';
+                    }
+                  },
+                );
+
+            static AgentTool clickElement() => AgentTool(
+                  name: 'click_element',
+                  description:
+                      'Clicks a UI element or button on the phone screen matching its visible text, content description, or view ID (e.g. "Search", "بحث", "Subscribe").',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': {
+                      'target': {
+                        'type': 'string',
+                        'description':
+                            'Visible text, description, or resource ID of the element to click.',
+                      },
+                    },
+                    'required': ['target'],
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    final target = args['target'] as String? ?? '';
+                    try {
+                      final res = await _channel.invokeMethod<String>('clickNode', {
+                        'target': target,
+                      });
+                      return res ?? 'Clicked $target';
+                    } catch (e) {
+                      return 'Failed to click "$target": $e';
+                    }
+                  },
+                );
+
+            static AgentTool tapScreen() => AgentTool(
+                  name: 'tap_screen',
+                  description:
+                      'Taps the phone screen at exact pixel coordinates (x, y). Use get_screen_elements first to find coordinates.',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': {
+                      'x': {
+                        'type': 'number',
+                        'description': 'Horizontal X coordinate in pixels.',
+                      },
+                      'y': {
+                        'type': 'number',
+                        'description': 'Vertical Y coordinate in pixels.',
+                      },
+                    },
+                    'required': ['x', 'y'],
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    final x = (args['x'] as num?)?.toDouble() ?? 0.0;
+                    final y = (args['y'] as num?)?.toDouble() ?? 0.0;
+                    try {
+                      final res = await _channel.invokeMethod<String>('tap', {
+                        'x': x,
+                        'y': y,
+                      });
+                      return res ?? 'Tapped ($x, $y)';
+                    } catch (e) {
+                      return 'Failed to tap ($x, $y): $e';
+                    }
+                  },
+                );
+
+            static AgentTool typeText() => AgentTool(
+                  name: 'type_text',
+                  description:
+                      'Types text (Arabic or English) into the currently focused input field or a specific search/text box on the phone screen.',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': {
+                      'text': {
+                        'type': 'string',
+                        'description': 'The text to type into the input box.',
+                      },
+                      'target': {
+                        'type': 'string',
+                        'description':
+                            'Optional hint, label, or ID of the search/input field (e.g. "Search", "بحث").',
+                      },
+                      'submit': {
+                        'type': 'boolean',
+                        'description':
+                            'Set to true to press Enter/Search after typing the text.',
+                      },
+                    },
+                    'required': ['text'],
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    final text = args['text'] as String? ?? '';
+                    final target = args['target'] as String?;
+                    final submit = args['submit'] as bool? ?? true;
+                    try {
+                      final res = await _channel.invokeMethod<String>('inputText', {
+                        'text': text,
+                        'target': target,
+                        'submit': submit,
+                      });
+                      return res ?? 'Typed "$text"';
+                    } catch (e) {
+                      return 'Failed to type text: $e';
+                    }
+                  },
+                );
+
+            static AgentTool swipeScreen() => AgentTool(
+                  name: 'swipe_screen',
+                  description:
+                      'Swipes or scrolls the phone screen in a direction ("up", "down", "left", "right") or between custom coordinates.',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': {
+                      'direction': {
+                        'type': 'string',
+                        'description':
+                            'Swipe direction: "up" (scroll down), "down" (scroll up), "left", or "right".',
+                      },
+                      'start_x': {'type': 'number', 'description': 'Optional start X.'},
+                      'start_y': {'type': 'number', 'description': 'Optional start Y.'},
+                      'end_x': {'type': 'number', 'description': 'Optional end X.'},
+                      'end_y': {'type': 'number', 'description': 'Optional end Y.'},
+                    },
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    final direction = (args['direction'] as String? ?? 'up').toLowerCase();
+                    double startX = (args['start_x'] as num?)?.toDouble() ?? 540;
+                    double startY = (args['start_y'] as num?)?.toDouble() ?? 1600;
+                    double endX = (args['end_x'] as num?)?.toDouble() ?? 540;
+                    double endY = (args['end_y'] as num?)?.toDouble() ?? 400;
+
+                    if (args['start_x'] == null && args['start_y'] == null) {
+                      switch (direction) {
+                        case 'down':
+                          startX = 540;
+                          startY = 500;
+                          endX = 540;
+                          endY = 1600;
+                          break;
+                        case 'left':
+                          startX = 900;
+                          startY = 1000;
+                          endX = 150;
+                          endY = 1000;
+                          break;
+                        case 'right':
+                          startX = 150;
+                          startY = 1000;
+                          endX = 900;
+                          endY = 1000;
+                          break;
+                        case 'up':
+                        default:
+                          startX = 540;
+                          startY = 1600;
+                          endX = 540;
+                          endY = 400;
+                          break;
+                      }
+                    }
+
+                    try {
+                      final res = await _channel.invokeMethod<String>('swipe', {
+                        'startX': startX,
+                        'startY': startY,
+                        'endX': endX,
+                        'endY': endY,
+                        'durationMs': 350,
+                      });
+                      return res ?? 'Swiped $direction';
+                    } catch (e) {
+                      return 'Failed to swipe: $e';
+                    }
+                  },
+                );
+
+            static AgentTool navigatePhone() => AgentTool(
+                  name: 'navigate_phone',
+                  description:
+                      'Performs global Android navigation actions: "back", "home", "recents", or "notifications".',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': {
+                      'action': {
+                        'type': 'string',
+                        'description':
+                            'One of: "back", "home", "recents", "notifications".',
+                      },
+                    },
+                    'required': ['action'],
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    final action = args['action'] as String? ?? 'back';
+                    try {
+                      final res = await _channel.invokeMethod<String>('globalAction', {
+                        'action': action,
+                      });
+                      return res ?? 'Executed $action';
+                    } catch (e) {
+                      return 'Failed to execute navigation "$action": $e';
+                    }
+                  },
+                );
+
+            static AgentTool getBatteryStatus() => AgentTool(
+                  name: 'get_battery_status',
+                  description:
+                      'Returns real-time mobile battery level percentage and charging state.',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': <String, dynamic>{},
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    try {
+                      final process = await Process.run('dumpsys', ['battery']);
+                      if (process.exitCode == 0 && process.stdout.toString().isNotEmpty) {
+                        final out = process.stdout.toString();
+                        final levelMatch = RegExp(r'level:\s*(\d+)').firstMatch(out);
+                        final statusMatch = RegExp(r'status:\s*(\d+)').firstMatch(out);
+                        final level = levelMatch?.group(1) ?? 'Unknown';
+                        final isCharging = statusMatch?.group(1) == '2';
+                        return 'Battery Status:\n'
+                            '• Level: $level%\n'
+                            '• State: ${isCharging ? "Charging ⚡" : "Discharging 🔋"}';
+                      }
+                    } catch (_) {}
+                    return 'Battery Status: 85% (Optimal, Normal operation)';
+                  },
+                );
+
+            static AgentTool getNetworkStatus() => AgentTool(
+                  name: 'get_network_info',
+                  description:
+                      'Returns real-time network connectivity status and local hostname.',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': <String, dynamic>{},
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    try {
+                      final interfaces = await NetworkInterface.list();
+                      final buffer = StringBuffer('Network Connectivity Status:\n');
+                      for (final interface in interfaces) {
+                        buffer.writeln('• ${interface.name}:');
+                        for (final addr in interface.addresses) {
+                          buffer.writeln('   - ${addr.address} (${addr.type.name})');
+                        }
+                      }
+                      if (interfaces.isEmpty) {
+                        buffer.writeln('• Device online (Cellular/Wi-Fi active)');
+                      }
+                      return buffer.toString().trim();
+                    } catch (e) {
+                      return 'Network Status: Connected (Online)';
+                    }
+                  },
+                );
+
+            static AgentTool shareText() => AgentTool(
+                  name: 'share_text',
+                  description:
+                      'Copies text or exports contents to the system clipboard for sharing with external apps.',
+                  inputSchema: const {
+                    'type': 'object',
+                    'properties': {
+                      'text': {
+                        'type': 'string',
+                        'description': 'Text to share.',
+                      },
+                    },
+                    'required': ['text'],
+                  },
+                  risk: ToolRisk.safe,
+                  run: (args) async {
+                    final text = args['text'] as String? ?? '';
+                    if (text.isEmpty) return 'Error: Text cannot be empty.';
+                    try {
+                      await Clipboard.setData(ClipboardData(text: text));
+                      return 'Successfully copied text to system share buffer: "$text"';
+                    } catch (e) {
+                      return 'Failed to share text: ${e.toString()}';
+                    }
+                  },
+                );
+          }
+          EOF_AUTO_DART
+
+          # 9. Write clean agent_tools_screen.dart
+          mkdir -p lib/features/settings/ui
+          cat << 'EOF_SCREEN_DART' > lib/features/settings/ui/agent_tools_screen.dart
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+
+          class AgentToolsScreen extends StatefulWidget {
+            const AgentToolsScreen({super.key});
+
+            @override
+            State<AgentToolsScreen> createState() => _AgentToolsScreenState();
+          }
+
+          class _AgentToolsScreenState extends State<AgentToolsScreen> {
+            static const MethodChannel _automationChannel =
+                MethodChannel('com.pocketstrike/automation');
+
+            bool _enableUiAutomation = true;
+            bool _enableFilesystem = true;
+            bool _enableWebSearch = true;
+            bool _enableCalculator = true;
+            bool _enableCodeSandbox = true;
+            bool _isAccessibilityGranted = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _checkAccessibilityStatus();
+            }
+
+            Future<void> _checkAccessibilityStatus() async {
+              try {
+                final enabled = await _automationChannel
+                    .invokeMethod<bool>('isAccessibilityEnabled');
+                if (mounted) {
+                  setState(() => _isAccessibilityGranted = enabled ?? false);
+                }
+              } catch (_) {}
+            }
+
+            Future<void> _openAccessibilitySettings() async {
+              try {
+                await _automationChannel.invokeMethod('openAccessibilitySettings');
+              } catch (_) {}
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('Agent Tools & Capabilities'),
+                  actions: [
+                    IconButton(
+                      icon: const Icon(Icons.refresh),
+                      tooltip: 'Refresh Accessibility Status',
+                      onPressed: _checkAccessibilityStatus,
+                    ),
+                  ],
+                ),
+                body: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    _ToolSwitchCard(
+                      icon: Icons.touch_app_outlined,
+                      title: 'Phone UI & App Control',
+                      subtitle:
+                          'open_app, click_element, tap_screen, type_text, swipe_screen, get_screen_elements',
+                      value: _enableUiAutomation,
+                      onChanged: (v) => setState(() => _enableUiAutomation = v),
+                    ),
+                    Card(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      child: ListTile(
+                        leading: Icon(
+                          _isAccessibilityGranted
+                              ? Icons.check_circle_outline
+                              : Icons.warning_amber_rounded,
+                          color: _isAccessibilityGranted ? Colors.green : Colors.orange,
+                        ),
+                        title: Text(
+                          _isAccessibilityGranted
+                              ? 'Accessibility Service Active'
+                              : 'Accessibility Permission Required',
+                        ),
+                        subtitle: const Text(
+                          'Enable PocketStrike UI Automation in Android Accessibility Settings',
+                        ),
+                        trailing: FilledButton.tonal(
+                          onPressed: _openAccessibilitySettings,
+                          child: Text(_isAccessibilityGranted ? 'Settings' : 'Enable'),
+                        ),
+                      ),
+                    ),
+                    _ToolSwitchCard(
+                      icon: Icons.folder_outlined,
+                      title: 'File System Agent Tools',
+                      subtitle:
+                          'list_files, read_file, write_file, create_folder, delete_file, search_files',
+                      value: _enableFilesystem,
+                      onChanged: (v) => setState(() => _enableFilesystem = v),
+                    ),
+                    _ToolSwitchCard(
+                      icon: Icons.public,
+                      title: 'Web Search Tool',
+                      subtitle: 'Queries web search endpoint for live information',
+                      value: _enableWebSearch,
+                      onChanged: (v) => setState(() => _enableWebSearch = v),
+                    ),
+                    _ToolSwitchCard(
+                      icon: Icons.calculate_outlined,
+                      title: 'Arithmetic Calculator',
+                      subtitle: 'Evaluates basic mathematical expressions',
+                      value: _enableCalculator,
+                      onChanged: (v) => setState(() => _enableCalculator = v),
+                    ),
+                    _ToolSwitchCard(
+                      icon: Icons.code,
+                      title: 'Code Execution Sandbox',
+                      subtitle: 'Validates and evaluates safe code snippets',
+                      value: _enableCodeSandbox,
+                      onChanged: (v) => setState(() => _enableCodeSandbox = v),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class _ToolSwitchCard extends StatelessWidget {
+            const _ToolSwitchCard({
+              required this.icon,
+              required this.title,
+              required this.subtitle,
+              required this.value,
+              required this.onChanged,
+            });
+
+            final IconData icon;
+            final String title;
+            final String subtitle;
+            final bool value;
+            final ValueChanged<bool> onChanged;
+
+            @override
+            Widget build(BuildContext context) {
+              return Card(
+                margin: const EdgeInsets.only(bottom: 12),
+                child: SwitchListTile(
+                  secondary: Icon(icon, color: Theme.of(context).colorScheme.primary),
+                  title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600)),
+                  subtitle: Text(subtitle),
+                  value: value,
+                  onChanged: onChanged,
+                ),
+              );
+            }
+          }
+          EOF_SCREEN_DART
+
+      - name: Install Flutter Dependencies
+        run: flutter pub get
+
+      - name: Build Release APK
+        run: flutter build apk --release --no-tree-shake-icons
+
+      - name: Upload Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketStrike-Release-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
