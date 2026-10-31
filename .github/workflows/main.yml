@@ -33,21 +33,18 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Auto-Apply Human Eye Vision & Automation Files
+      - name: Auto-Apply ARTEMIS 5-Part Engine & Live Screen Vision
         run: |
-          # 0. If files are nested inside PocketStrike-main/, move them to repo root
           if [ ! -f pubspec.yaml ] && [ -f PocketStrike-main/pubspec.yaml ]; then
             shopt -s dotglob
             mv PocketStrike-main/* .
             rmdir PocketStrike-main || true
           fi
 
-          # 1. Fix pubspec.yaml: ensure flutter and flutter_test keep 'sdk: flutter', and environment uses '>=3.5.0 <4.0.0'
           sed -i '/environment:/,+1 s/sdk:.*/sdk: ">=3.5.0 <4.0.0"/' pubspec.yaml
           sed -i '/flutter:/,+1 s/sdk:.*/sdk: flutter/' pubspec.yaml
           sed -i '/flutter_test:/,+1 s/sdk:.*/sdk: flutter/' pubspec.yaml
 
-          # 2. Ensure compileSdk and Gradle memory are safe on GitHub Actions
           if [ -f android/app/build.gradle.kts ]; then
             if ! "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --list_installed | grep -q "platforms;android-37"; then
               sed -i 's/compileSdk = 37/compileSdk = 36/g' android/app/build.gradle.kts
@@ -57,9 +54,6 @@ jobs:
             sed -i 's/-Xmx8G -XX:MaxMetaspaceSize=4G/-Xmx4G -XX:MaxMetaspaceSize=2G/g' android/gradle.properties
           fi
 
-
-
-          # 4. Write clean accessibility_service_config.xml (with canTakeScreenshot="true")
           mkdir -p android/app/src/main/res/xml
           cat << 'EOF_ACC_XML' > android/app/src/main/res/xml/accessibility_service_config.xml
           <?xml version="1.0" encoding="utf-8"?>
@@ -73,7 +67,6 @@ jobs:
               android:notificationTimeout="50" />
           EOF_ACC_XML
 
-          # 5. Write clean PocketStrikeAccessibilityService.kt (Human Eye Vision + Game Radar + Multi-Touch)
           mkdir -p android/app/src/main/kotlin/com/pocketstrike/pocketstrike
           cat << 'EOF_ACC_KT' > android/app/src/main/kotlin/com/pocketstrike/pocketstrike/PocketStrikeAccessibilityService.kt
           package com.pocketstrike.pocketstrike
@@ -88,12 +81,16 @@ jobs:
           import android.graphics.Rect
           import android.os.Build
           import android.os.Bundle
+          import android.util.Log
           import android.view.Display
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
           import org.json.JSONArray
+          import java.io.ByteArrayOutputStream
           import java.io.File
           import java.io.FileOutputStream
+          import java.security.MessageDigest
+          import java.util.concurrent.ConcurrentHashMap
           import java.util.concurrent.CountDownLatch
           import java.util.concurrent.TimeUnit
           import kotlin.math.abs
@@ -103,19 +100,36 @@ jobs:
           class PocketStrikeAccessibilityService : AccessibilityService() {
 
               companion object {
+                  private const val TAG = "PocketStrikeVision"
+
                   @Volatile
                   var instance: PocketStrikeAccessibilityService? = null
                       private set
               }
+
+              data class IndexedTarget(
+                  val index: Int,
+                  val label: String,
+                  val centerX: Int,
+                  val centerY: Int,
+                  val bounds: Rect,
+                  val isUiNode: Boolean
+              )
+
+              private val indexedTargets = ConcurrentHashMap<Int, IndexedTarget>()
+
+              @Volatile
+              private var lastFrameHash: String = ""
+
+              @Volatile
+              private var lastCaptureTimeMs: Long = 0L
 
               override fun onServiceConnected() {
                   super.onServiceConnected()
                   instance = this
               }
 
-              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-                  // Inspected on-demand via rootInActiveWindow and takeScreenshot
-              }
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
               override fun onInterrupt() {}
 
@@ -126,133 +140,314 @@ jobs:
                   super.onDestroy()
               }
 
-              /**
-               * Human Eye (العين البشرية): Captures real-time screen pixels, draws a calibrated
-               * real-screen (x, y) coordinate grid directly onto the image for 100% first-tap accuracy,
-               * and runs an on-device Visual Game Radar.
-               */
-              fun captureScreenVision(): String {
-                  val dm = resources.displayMetrics
-                  val screenW = dm.widthPixels
-                  val screenH = dm.heightPixels
-                  val orientation = if (screenW > screenH) "Landscape (Game Mode)" else "Portrait"
-
-                  val sb = StringBuilder()
-                  val root = rootInActiveWindow
-                  val activePkg = root?.packageName?.toString() ?: "unknown_or_fullscreen_game"
-
-                  sb.appendLine("=== HUMAN EYE LIVE SCREEN VISION ===")
-                  sb.appendLine("Screen Resolution: ${screenW}x${screenH} ($orientation)")
-                  sb.appendLine("Active App/Game Package: $activePkg")
-                  sb.appendLine(
-                      "COORDINATE GUIDE: Read real screen (x,y) coordinates from the yellow grid labels on the attached image."
-                  )
-                  sb.appendLine(
-                      "SAFETY & GOAL CHECK: (1) Avoid tapping Top-Right/Top-Left HUD corners (y < ${(screenH * 0.16).toInt()}) where Settings/Pause gear icons live. " +
-                          "(2) Check the current Level/screen state against the user request: if the requested level or goal is already completed (e.g. user asked for Level 1 only and screen now shows Victory or Level 2), STOP calling tools immediately and report completion!"
-                  )
-
-                  var capturedBitmap: Bitmap? = null
-
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                      val latch = CountDownLatch(1)
-                      try {
-                          takeScreenshot(
-                              Display.DEFAULT_DISPLAY,
-                              mainExecutor,
-                              object : TakeScreenshotCallback {
-                                  override fun onSuccess(screenshot: ScreenshotResult) {
-                                      try {
-                                          val hwBuffer = screenshot.hardwareBuffer
-                                          val colorSpace = screenshot.colorSpace
-                                          val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
-                                          if (hwBitmap != null) {
-                                              capturedBitmap = hwBitmap.copy(Bitmap.Config.ARGB_8888, true)
-                                              hwBitmap.recycle()
-                                          }
-                                          hwBuffer.close()
-                                      } catch (_: Exception) {
-                                      } finally {
-                                          latch.countDown()
-                                      }
-                                  }
-
-                                  override fun onFailure(errorCode: Int) {
-                                      latch.countDown()
-                                  }
-                              }
-                          )
-                          latch.await(4, TimeUnit.SECONDS)
-                      } catch (_: Exception) {}
-                  }
-
-                  val bmp = capturedBitmap
-                  if (bmp != null) {
-                      try {
-                          // 1. Run On-Device Visual Radar before drawing grid overlay
-                          val radarReport = analyzeBitmapForGames(bmp, screenW, screenH)
-                          sb.appendLine(radarReport)
-
-                          // 2. Scale image for fast multimodal upload and draw calibrated real-screen (x,y) coordinate grid
-                          val maxDim = 800
-                          val scale = min(1.0f, maxDim.toFloat() / max(bmp.width, bmp.height).toFloat())
-                          val targetW = max(1, (bmp.width * scale).toInt())
-                          val targetH = max(1, (bmp.height * scale).toInt())
-                          val scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
-                              .copy(Bitmap.Config.ARGB_8888, true)
-
-                          drawCalibratedCoordinateGrid(scaled, screenW, screenH)
-
-                          val outFile = File(applicationContext.cacheDir, "human_eye_latest.jpg")
-                          FileOutputStream(outFile).use { fos ->
-                              scaled.compress(Bitmap.CompressFormat.JPEG, 76, fos)
-                              fos.flush()
-                          }
-                          scaled.recycle()
-                          bmp.recycle()
-
-                          sb.appendLine("[SCREEN_VISION_IMAGE:${outFile.absolutePath}]")
-                      } catch (e: Exception) {
-                          sb.appendLine("Vision Frame Note: ${e.message}")
-                      }
-                  } else {
-                      sb.appendLine("Note: Live pixel buffer unavailable on this Android version or protected surface; using UI tree.")
-                  }
-
-                  val uiHierarchy = dumpUiHierarchy(maxNodes = 35)
-                  sb.appendLine("=== UI OVERLAY ELEMENTS ===")
-                  sb.appendLine(uiHierarchy)
-
-                  return sb.toString().trim()
+              fun resetVisionSession() {
+                  lastFrameHash = ""
               }
 
               /**
-               * Draws a subtle 6x8 coordinate grid with real-screen (x, y) labels onto the scaled screenshot
-               * so Vision LLMs never have to guess pixel coordinates.
+               * Captures a live frame with:
+               * 1. Minimum ~1s rate-limit throttle + automatic 1x retry on Android rate-limit error
+               * 2. MD5 pixel hash deduplication ("unchanged" vs "attached")
+               * 3. Downscaling so longest side <= 1280px, JPEG quality 65
+               * 4. ARTEMIS Set-of-Mark numbered badges [#1, #2...] + calibrated (x,y) grid
                */
-              private fun drawCalibratedCoordinateGrid(bmp: Bitmap, realW: Int, realH: Int) {
+              fun captureLiveVisionFrame(forceAttachEvenIfUnchanged: Boolean = false): Map<String, Any?> {
+                  val dm = resources.displayMetrics
+                  val screenW = dm.widthPixels
+                  val screenH = dm.heightPixels
+                  val orientation = if (screenW > screenH) "Landscape" else "Portrait"
+
+                  val root = rootInActiveWindow
+                  val activePkg = root?.packageName?.toString() ?: "fullscreen_canvas_or_game"
+
+                  // 1. Collect UI tree nodes first (ARTEMIS Dynamic-First / Trust Order Rule #1)
+                  val uiTargets = collectUiTargets(root, maxNodes = 40)
+                  indexedTargets.clear()
+                  for (t in uiTargets) {
+                      indexedTargets[t.index] = t
+                  }
+
+                  val uiDumpSb = StringBuilder()
+                  uiDumpSb.appendLine("Active App: $activePkg | Screen: ${screenW}x${screenH} ($orientation)")
+                  if (uiTargets.isEmpty()) {
+                      uiDumpSb.appendLine("UI Dump: [No standard XML nodes — custom Canvas/Game surface active]")
+                  } else {
+                      uiDumpSb.appendLine("UI Dump Elements (Trust these exact coordinates first):")
+                      for (t in uiTargets) {
+                          uiDumpSb.appendLine("  [#${t.index}] ${t.label} -> center=(${t.centerX}, ${t.centerY})")
+                      }
+                  }
+
+                  // 2. Capture screenshot via Android 11+ AccessibilityService.takeScreenshot with 1s throttle & 1x retry
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                      Log.i(TAG, "vision: capture failed: API < 30")
+                      return mapOf(
+                          "status" to "failed",
+                          "reason" to "Android version < 11 does not support Accessibility takeScreenshot",
+                          "uiDump" to uiDumpSb.toString().trim(),
+                          "activePackage" to activePkg
+                      )
+                  }
+
+                  val now = System.currentTimeMillis()
+                  val elapsedSinceLast = now - lastCaptureTimeMs
+                  if (elapsedSinceLast in 1..999) {
+                      try {
+                          Thread.sleep(1000L - elapsedSinceLast)
+                      } catch (_: Exception) {}
+                  }
+
+                  var rawBitmap = takeScreenshotOnce()
+                  if (rawBitmap == null) {
+                      // Respect Android accessibility screenshot rate limit and retry once after ~1.05s
+                      try {
+                          Thread.sleep(1050L)
+                      } catch (_: Exception) {}
+                      rawBitmap = takeScreenshotOnce()
+                  }
+
+                  val bmp = rawBitmap
+                  if (bmp == null) {
+                      Log.i(TAG, "vision: capture failed: takeScreenshot returned null")
+                      return mapOf(
+                          "status" to "failed",
+                          "reason" to "takeScreenshot rate-limited or blocked by secure window",
+                          "uiDump" to uiDumpSb.toString().trim(),
+                          "activePackage" to activePkg
+                      )
+                  }
+
+                  try {
+                      // 3. Downscale so longest side <= 1280px
+                      val maxDim = 1280
+                      val scale = min(1.0f, maxDim.toFloat() / max(bmp.width, bmp.height).toFloat())
+                      val targetW = max(1, (bmp.width * scale).toInt())
+                      val targetH = max(1, (bmp.height * scale).toInt())
+                      val scaledClean = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
+
+                      // Encode clean frame at JPEG quality 65 to compute deterministic MD5 frame hash
+                      val cleanBaos = ByteArrayOutputStream()
+                      scaledClean.compress(Bitmap.CompressFormat.JPEG, 65, cleanBaos)
+                      val cleanBytes = cleanBaos.toByteArray()
+                      val frameHash = md5Hex(cleanBytes)
+
+                      // 4. Run On-Device Visual Radar for Canvas/Game targets & append to indexedTargets
+                      val radarSb = StringBuilder()
+                      val radarTargets = analyzeBitmapForGames(
+                          bmp = scaledClean,
+                          screenW = screenW,
+                          screenH = screenH,
+                          startIndex = uiTargets.size + 1
+                      )
+                      if (radarTargets.isNotEmpty()) {
+                          radarSb.appendLine("Visual Radar Targets (Game/Canvas Hotspots):")
+                          for (rt in radarTargets) {
+                              indexedTargets[rt.index] = rt
+                              radarSb.appendLine("  [#${rt.index}] ${rt.label} -> center=(${rt.centerX}, ${rt.centerY})")
+                          }
+                      }
+
+                      val fullSummary = (uiDumpSb.toString() + "\n" + radarSb.toString()).trim()
+
+                      // 5. Dedup check: if identical to last attached frame, skip attaching duplicate image
+                      if (!forceAttachEvenIfUnchanged && frameHash == lastFrameHash && lastFrameHash.isNotEmpty()) {
+                          scaledClean.recycle()
+                          bmp.recycle()
+                          Log.i(TAG, "vision: skipped (frame unchanged)")
+                          return mapOf(
+                              "status" to "unchanged",
+                              "hash" to frameHash,
+                              "uiDump" to fullSummary,
+                              "activePackage" to activePkg
+                          )
+                      }
+
+                      lastFrameHash = frameHash
+
+                      // 6. Draw ARTEMIS Set-of-Mark badges [#1, #2] + calibrated coordinate grid onto the annotated copy
+                      val annotated = scaledClean.copy(Bitmap.Config.ARGB_8888, true)
+                      drawArtemisOverlay(annotated, screenW, screenH, uiTargets, radarTargets)
+
+                      val outFile = File(applicationContext.cacheDir, "human_eye_latest.jpg")
+                      FileOutputStream(outFile).use { fos ->
+                          annotated.compress(Bitmap.CompressFormat.JPEG, 65, fos)
+                          fos.flush()
+                      }
+
+                      annotated.recycle()
+                      scaledClean.recycle()
+                      bmp.recycle()
+
+                      Log.i(TAG, "vision: attached (hash=$frameHash, size=${outFile.length()} bytes)")
+                      return mapOf(
+                          "status" to "attached",
+                          "path" to outFile.absolutePath,
+                          "hash" to frameHash,
+                          "uiDump" to fullSummary,
+                          "activePackage" to activePkg
+                      )
+                  } catch (e: Exception) {
+                      try {
+                          bmp.recycle()
+                      } catch (_: Exception) {}
+                      Log.i(TAG, "vision: capture failed: ${e.message}")
+                      return mapOf(
+                          "status" to "failed",
+                          "reason" to (e.message ?: "unknown error"),
+                          "uiDump" to uiDumpSb.toString().trim(),
+                          "activePackage" to activePkg
+                      )
+                  }
+              }
+
+              /**
+               * Explicit tool fallback when the agent calls see_screen directly.
+               */
+              fun captureScreenVision(): String {
+                  val map = captureLiveVisionFrame(forceAttachEvenIfUnchanged = true)
+                  val status = map["status"] as? String ?: "failed"
+                  val uiDump = map["uiDump"] as? String ?: ""
+                  val path = map["path"] as? String
+                  val reason = map["reason"] as? String
+                  val sb = StringBuilder()
+                  sb.appendLine("=== ARTEMIS & HUMAN EYE LIVE SCREEN STATE ===")
+                  sb.appendLine(uiDump)
+                  if (status == "attached" && !path.isNullOrEmpty()) {
+                      sb.appendLine("[SCREEN_VISION_IMAGE:$path]")
+                  } else if (reason != null) {
+                      sb.appendLine("[vision: capture failed: $reason]")
+                  }
+                  return sb.toString().trim()
+              }
+
+              private fun takeScreenshotOnce(): Bitmap? {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+                  val latch = CountDownLatch(1)
+                  var captured: Bitmap? = null
+                  try {
+                      lastCaptureTimeMs = System.currentTimeMillis()
+                      takeScreenshot(
+                          Display.DEFAULT_DISPLAY,
+                          mainExecutor,
+                          object : TakeScreenshotCallback {
+                              override fun onSuccess(screenshot: ScreenshotResult) {
+                                  try {
+                                      val hwBuffer = screenshot.hardwareBuffer
+                                      val colorSpace = screenshot.colorSpace
+                                      val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+                                      if (hwBitmap != null) {
+                                          captured = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                          hwBitmap.recycle()
+                                      }
+                                      hwBuffer.close()
+                                  } catch (_: Exception) {
+                                  } finally {
+                                      latch.countDown()
+                                  }
+                              }
+
+                              override fun onFailure(errorCode: Int) {
+                                  latch.countDown()
+                              }
+                          }
+                      )
+                      latch.await(3500, TimeUnit.MILLISECONDS)
+                  } catch (_: Exception) {}
+                  return captured
+              }
+
+              private fun md5Hex(bytes: ByteArray): String {
+                  val md = MessageDigest.getInstance("MD5")
+                  val digest = md.digest(bytes)
+                  val sb = StringBuilder(digest.size * 2)
+                  for (b in digest) {
+                      sb.append(String.format("%02x", b))
+                  }
+                  return sb.toString()
+              }
+
+              private fun collectUiTargets(root: AccessibilityNodeInfo?, maxNodes: Int): List<IndexedTarget> {
+                  if (root == null) return emptyList()
+                  val list = mutableListOf<IndexedTarget>()
+                  var idx = 1
+
+                  fun traverse(node: AccessibilityNodeInfo?) {
+                      if (node == null || idx > maxNodes) return
+                      val text = node.text?.toString()?.trim().orEmpty()
+                      val desc = node.contentDescription?.toString()?.trim().orEmpty()
+                      val viewId = node.viewIdResourceName?.substringAfter("/") ?: ""
+                      val isClickable = node.isClickable
+                      val isEditable = node.isEditable
+                      val isScrollable = node.isScrollable
+
+                      if (text.isNotEmpty() || desc.isNotEmpty() || isClickable || isEditable) {
+                          val rect = Rect()
+                          node.getBoundsInScreen(rect)
+                          if (rect.width() > 8 && rect.height() > 8) {
+                              val cls = node.className?.toString()?.substringAfterLast('.') ?: "View"
+                              val flags = mutableListOf<String>()
+                              if (isClickable) flags.add("click")
+                              if (isEditable) flags.add("edit")
+                              if (isScrollable) flags.add("scroll")
+                              val labelParts = mutableListOf<String>(cls)
+                              if (text.isNotEmpty()) labelParts.add("text='$text'")
+                              if (desc.isNotEmpty()) labelParts.add("desc='$desc'")
+                              if (viewId.isNotEmpty()) labelParts.add("id='$viewId'")
+                              if (flags.isNotEmpty()) labelParts.add("(${flags.joinToString(",")})")
+
+                              list.add(
+                                  IndexedTarget(
+                                      index = idx++,
+                                      label = labelParts.joinToString(" "),
+                                      centerX = rect.centerX(),
+                                      centerY = rect.centerY(),
+                                      bounds = rect,
+                                      isUiNode = true
+                                  )
+                              )
+                          }
+                      }
+                      for (i in 0 until node.childCount) {
+                          traverse(node.getChild(i))
+                      }
+                  }
+
+                  traverse(root)
+                  return list
+              }
+
+              private fun drawArtemisOverlay(
+                  bmp: Bitmap,
+                  realW: Int,
+                  realH: Int,
+                  uiTargets: List<IndexedTarget>,
+                  radarTargets: List<IndexedTarget>
+              ) {
                   val canvas = Canvas(bmp)
                   val w = bmp.width.toFloat()
                   val h = bmp.height.toFloat()
+                  val scaleX = w / realW.toFloat()
+                  val scaleY = h / realH.toFloat()
+
+                  // 1. Subtle 6x8 calibrated (x,y) coordinate grid
                   val cols = 6
                   val rows = 8
-
                   val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(110, 0, 255, 255)
-                      strokeWidth = 1.2f
+                      color = Color.argb(95, 0, 255, 255)
+                      strokeWidth = 1.1f
                       style = Paint.Style.STROKE
                   }
                   val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(220, 255, 255, 0)
+                      color = Color.argb(210, 255, 255, 0)
                       style = Paint.Style.FILL
                   }
                   val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(165, 0, 0, 0)
+                      color = Color.argb(160, 0, 0, 0)
                       style = Paint.Style.FILL
                   }
                   val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                       color = Color.rgb(255, 255, 100)
-                      textSize = max(11f, min(w, h) * 0.024f)
+                      textSize = max(11f, min(w, h) * 0.022f)
                       isFakeBoldText = true
                   }
 
@@ -264,41 +459,64 @@ jobs:
                       val gy = (h * r) / rows
                       canvas.drawLine(0f, gy, w, gy, linePaint)
                   }
-
                   for (r in 1 until rows) {
                       for (c in 1 until cols) {
                           val gx = (w * c) / cols
                           val gy = (h * r) / rows
-                          val realX = (realW * c) / cols
-                          val realY = (realH * r) / rows
-                          val label = "$realX,$realY"
-
-                          canvas.drawCircle(gx, gy, 3f, dotPaint)
+                          val rx = (realW * c) / cols
+                          val ry = (realH * r) / rows
+                          val label = "$rx,$ry"
+                          canvas.drawCircle(gx, gy, 2.5f, dotPaint)
                           val tw = textPaint.measureText(label)
                           val th = textPaint.textSize
-                          canvas.drawRect(gx + 3f, gy - th, gx + tw + 7f, gy + 3f, bgPaint)
-                          canvas.drawText(label, gx + 5f, gy - 1f, textPaint)
+                          canvas.drawRect(gx + 2f, gy - th, gx + tw + 6f, gy + 2f, bgPaint)
+                          canvas.drawText(label, gx + 4f, gy - 1f, textPaint)
                       }
+                  }
+
+                  // 2. ARTEMIS Set-of-Mark badges [#1, #2...] over interactive targets
+                  val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.argb(215, 220, 20, 60)
+                      style = Paint.Style.FILL
+                  }
+                  val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.WHITE
+                      textSize = max(12f, min(w, h) * 0.025f)
+                      isFakeBoldText = true
+                  }
+
+                  val allToMark = (uiTargets.take(20) + radarTargets.take(10))
+                  for (t in allToMark) {
+                      val bx = t.centerX * scaleX
+                      val by = t.centerY * scaleY
+                      val tag = "#${t.index}"
+                      val tw = badgeTextPaint.measureText(tag)
+                      val th = badgeTextPaint.textSize
+                      canvas.drawRect(bx - tw / 2 - 4f, by - th / 2 - 3f, bx + tw / 2 + 4f, by + th / 2 + 3f, badgeBgPaint)
+                      canvas.drawText(tag, bx - tw / 2, by + th / 3, badgeTextPaint)
                   }
               }
 
-              private fun analyzeBitmapForGames(bmp: Bitmap, screenW: Int, screenH: Int): String {
+              private fun analyzeBitmapForGames(
+                  bmp: Bitmap,
+                  screenW: Int,
+                  screenH: Int,
+                  startIndex: Int
+              ): List<IndexedTarget> {
                   val cols = 8
                   val rows = 12
                   val bw = bmp.width
                   val bh = bmp.height
 
-                  data class Hotspot(
-                      val screenX: Int,
-                      val screenY: Int,
-                      val contrastScore: Double,
-                      val colorLabel: String,
-                      val zoneLabel: String
+                  data class RawSpot(
+                      val realX: Int,
+                      val realY: Int,
+                      val score: Double,
+                      val label: String
                   )
 
-                  val hotspots = mutableListOf<Hotspot>()
-
-                  for (r in 0 until rows) {
+                  val spots = mutableListOf<RawSpot>()
+                  for (r in 2 until (rows - 1)) { // Skip r < 2 (Top HUD / Settings gear) & bottom system bar
                       for (c in 0 until cols) {
                           val x0 = (c * bw) / cols
                           val y0 = (r * bh) / rows
@@ -327,39 +545,37 @@ jobs:
                           if (score > 28.0) {
                               val realX = ((cx.toFloat() / bw.toFloat()) * screenW).toInt()
                               val realY = ((cy.toFloat() / bh.toFloat()) * screenH).toInt()
-                              if (r < 2) continue // Skip top HUD bar (Settings gear / Pause / Coins) during gameplay
                               val zone = when {
-                                  r >= rows - 2 -> "Bottom-Bar (Powerups)"
-                                  c < 3 -> "Play-Arena-Left"
-                                  c >= cols - 3 -> "Play-Arena-Right"
-                                  else -> "Play-Arena-Center"
+                                  r >= rows - 2 -> "Bottom-Bar"
+                                  c < 3 -> "Arena-Left"
+                                  c >= cols - 3 -> "Arena-Right"
+                                  else -> "Arena-Center"
                               }
-                              hotspots.add(
-                                  Hotspot(
-                                      screenX = realX,
-                                      screenY = realY,
-                                      contrastScore = score,
-                                      colorLabel = classifyColor(centerPixel, hsv),
-                                      zoneLabel = zone
+                              val colorName = classifyColor(centerPixel, hsv)
+                              spots.add(
+                                  RawSpot(
+                                      realX = realX,
+                                      realY = realY,
+                                      score = score,
+                                      label = "[$zone] $colorName target"
                                   )
                               )
                           }
                       }
                   }
 
-                  val topSpots = hotspots.sortedByDescending { it.contrastScore }.take(12)
-                  val out = StringBuilder()
-                  out.appendLine("=== ON-DEVICE VISUAL RADAR (DETECTED TARGETS & BUTTONS) ===")
-                  if (topSpots.isEmpty()) {
-                      out.appendLine("• Uniform screen surface detected. Use Center=(${screenW / 2},${screenH / 2}) to tap/start.")
-                  } else {
-                      for ((idx, spot) in topSpots.withIndex()) {
-                          out.appendLine(
-                              "• Target #${idx + 1}: [${spot.zoneLabel}] ${spot.colorLabel} object/button at (${spot.screenX}, ${spot.screenY})"
-                          )
-                      }
+                  val top = spots.sortedByDescending { it.score }.take(10)
+                  var idx = startIndex
+                  return top.map { s ->
+                      IndexedTarget(
+                          index = idx++,
+                          label = s.label,
+                          centerX = s.realX,
+                          centerY = s.realY,
+                          bounds = Rect(s.realX - 30, s.realY - 30, s.realX + 30, s.realY + 30),
+                          isUiNode = false
+                      )
                   }
-                  return out.toString().trim()
               }
 
               private fun colorDiff(c1: Int, c2: Int): Int {
@@ -375,7 +591,7 @@ jobs:
                   if (v < 0.18f) return "Dark/Black"
                   if (s < 0.18f) return if (v > 0.82f) "Bright-White" else "Gray/Silver"
                   return when {
-                      h < 20f || h >= 340f -> "Red/Crimson"
+                      h < 20f || h >= 340f -> "Red/Pink"
                       h < 45f -> "Orange/Bronze"
                       h < 70f -> "Yellow/Gold"
                       h < 165f -> "Green/Emerald"
@@ -386,10 +602,6 @@ jobs:
                   }
               }
 
-              /**
-               * Clamps game coordinates away from the very top status bar and very bottom Android navigation bar
-               * so game taps never accidentally switch apps or trigger Home/Back.
-               */
               private fun safeX(x: Float): Float {
                   val w = resources.displayMetrics.widthPixels.toFloat()
                   return x.coerceIn(12f, max(20f, w - 12f))
@@ -400,10 +612,17 @@ jobs:
                   return y.coerceIn(45f, max(100f, h - 75f))
               }
 
-              /**
-               * Executes a batch sequence of game actions in a SINGLE tool call so the agent can solve
-               * an entire puzzle level (e.g. tapping 9 matching cars in order) without 20 round-trips.
-               */
+              fun clickByIndex(index: Int): String {
+                  val target = indexedTargets[index]
+                      ?: return "Error: Target index #$index not found in current frame. Check UI dump or coordinates."
+                  val ok = tapCoordinates(safeX(target.centerX.toFloat()), safeY(target.centerY.toFloat()), 65L)
+                  return if (ok) {
+                      "Clicked [#${target.index}] ${target.label} at (${target.centerX}, ${target.centerY})."
+                  } else {
+                      "Failed to click [#${target.index}] at (${target.centerX}, ${target.centerY})."
+                  }
+              }
+
               fun performGameBatch(stepsJson: String): String {
                   return try {
                       val arr = JSONArray(stepsJson)
@@ -412,8 +631,11 @@ jobs:
                       for (i in 0 until count) {
                           val obj = arr.getJSONObject(i)
                           val type = obj.optString("action_type", "tap")
-                          val x = obj.optDouble("x", 540.0).toFloat()
-                          val y = obj.optDouble("y", 1200.0).toFloat()
+                          val targetIdx = obj.optInt("target_index", -1)
+                          val indexed = if (targetIdx > 0) indexedTargets[targetIdx] else null
+
+                          val x = indexed?.centerX?.toFloat() ?: obj.optDouble("x", 540.0).toFloat()
+                          val y = indexed?.centerY?.toFloat() ?: obj.optDouble("y", 1200.0).toFloat()
                           val endX = obj.optDouble("end_x", x.toDouble()).toFloat()
                           val endY = obj.optDouble("end_y", y.toDouble()).toFloat()
                           val secondX = obj.optDouble("second_x", 850.0).toFloat()
@@ -427,7 +649,7 @@ jobs:
                               Thread.sleep(waitAfterMs)
                           }
                       }
-                      "Executed ${results.size} batch game steps:\n" + results.joinToString("\n")
+                      "Executed ${results.size} ARTEMIS Action Burst steps:\n" + results.joinToString("\n")
                   } catch (e: Exception) {
                       "Batch execution error: ${e.message}"
                   }
@@ -451,21 +673,15 @@ jobs:
                   val s2y = safeY(secondY)
 
                   return when (actionType.trim().lowercase()) {
-                      "tap", "fast_tap" -> {
-                          tapCoordinates(sx, sy, durationMs.coerceIn(40L, 250L))
-                      }
+                      "tap", "fast_tap" -> tapCoordinates(sx, sy, durationMs.coerceIn(40L, 250L))
                       "double_tap" -> {
                           val ok1 = tapCoordinates(sx, sy, 45L)
                           Thread.sleep(70)
                           val ok2 = tapCoordinates(sx, sy, 45L)
                           ok1 && ok2
                       }
-                      "hold", "long_press" -> {
-                          tapCoordinates(sx, sy, durationMs.coerceIn(400L, 8000L))
-                      }
-                      "joystick", "drag", "swipe" -> {
-                          swipe(sx, sy, ex, ey, durationMs.coerceIn(80L, 8000L))
-                      }
+                      "hold", "long_press" -> tapCoordinates(sx, sy, durationMs.coerceIn(400L, 8000L))
+                      "joystick", "drag", "swipe" -> swipe(sx, sy, ex, ey, durationMs.coerceIn(80L, 8000L))
                       "multi_touch", "two_finger" -> {
                           val path1 = Path().apply {
                               moveTo(sx, sy)
@@ -473,9 +689,7 @@ jobs:
                                   lineTo(ex, ey)
                               }
                           }
-                          val path2 = Path().apply {
-                              moveTo(s2x, s2y)
-                          }
+                          val path2 = Path().apply { moveTo(s2x, s2y) }
                           val d1 = durationMs.coerceIn(100L, 5000L)
                           val d2 = min(d1, 180L)
                           val stroke1 = GestureDescription.StrokeDescription(path1, 0L, d1)
@@ -493,53 +707,33 @@ jobs:
               fun dumpUiHierarchy(maxNodes: Int = 80): String {
                   val root = rootInActiveWindow
                       ?: return "No standard XML UI tree (Fullscreen Game / Canvas active)."
+                  val targets = collectUiTargets(root, maxNodes)
+                  for (t in targets) {
+                      indexedTargets[t.index] = t
+                  }
+                  if (targets.isEmpty()) {
+                      return "Canvas/Game surface active (${root.packageName}) — use live vision frame coordinates."
+                  }
                   val sb = StringBuilder()
                   sb.appendLine("Active Package: ${root.packageName ?: "unknown"}")
-                  var count = 0
-
-                  fun traverse(node: AccessibilityNodeInfo?, depth: Int) {
-                      if (node == null || count >= maxNodes) return
-                      val text = node.text?.toString()?.trim().orEmpty()
-                      val desc = node.contentDescription?.toString()?.trim().orEmpty()
-                      val viewId = node.viewIdResourceName?.substringAfter("/") ?: ""
-                      val isClickable = node.isClickable
-                      val isEditable = node.isEditable
-                      val isScrollable = node.isScrollable
-
-                      if (text.isNotEmpty() || desc.isNotEmpty() || isClickable || isEditable) {
-                          val rect = Rect()
-                          node.getBoundsInScreen(rect)
-                          if (rect.width() > 0 && rect.height() > 0) {
-                              count++
-                              val cx = rect.centerX()
-                              val cy = rect.centerY()
-                              val flags = mutableListOf<String>()
-                              if (isClickable) flags.add("clickable")
-                              if (isEditable) flags.add("editable")
-                              if (isScrollable) flags.add("scrollable")
-                              val cls = node.className?.toString()?.substringAfterLast('.') ?: "View"
-                              sb.appendLine(
-                                  "[$count] $cls | text='$text' | desc='$desc' | id='$viewId' | center=($cx,$cy) | flags=${flags.joinToString(",")}"
-                              )
-                          }
-                      }
-
-                      for (i in 0 until node.childCount) {
-                          traverse(node.getChild(i), depth + 1)
-                      }
+                  for (t in targets) {
+                      sb.appendLine("[#${t.index}] ${t.label} | center=(${t.centerX},${t.centerY})")
                   }
-
-                  traverse(root, 0)
-                  return if (count == 0) {
-                      "Canvas/Game surface active (${root.packageName}) — use see_screen coordinate grid & game_action."
-                  } else {
-                      sb.toString().trim()
-                  }
+                  return sb.toString().trim()
               }
 
               fun clickByText(query: String): Boolean {
                   val root = rootInActiveWindow ?: return false
-                  val normalized = query.trim().lowercase()
+                  val trimmed = query.trim()
+                  if (trimmed.startsWith("#") && trimmed.substring(1).toIntOrNull() != null) {
+                      val idx = trimmed.substring(1).toInt()
+                      val target = indexedTargets[idx]
+                      if (target != null) {
+                          return tapCoordinates(safeX(target.centerX.toFloat()), safeY(target.centerY.toFloat()))
+                      }
+                  }
+
+                  val normalized = trimmed.lowercase()
                   val match = findNodeMatching(root) { node ->
                       val t = node.text?.toString()?.lowercase().orEmpty()
                       val d = node.contentDescription?.toString()?.lowercase().orEmpty()
@@ -690,7 +884,6 @@ jobs:
           }
           EOF_ACC_KT
 
-          # 6. Write clean MainActivity.kt
           cat << 'EOF_MAIN_KT' > android/app/src/main/kotlin/com/pocketstrike/pocketstrike/MainActivity.kt
           package com.pocketstrike.pocketstrike
 
@@ -866,6 +1059,23 @@ jobs:
                                           startActivity(intent)
                                           "Opened Android Accessibility Settings."
                                       }
+                                      "resetVisionSession" -> {
+                                          PocketStrikeAccessibilityService.instance?.resetVisionSession()
+                                          true
+                                      }
+                                      "captureLiveVisionFrame" -> {
+                                          val forceAttach = call.argument<Boolean>("forceAttach") ?: false
+                                          val svc = PocketStrikeAccessibilityService.instance
+                                          if (svc == null) {
+                                              mapOf(
+                                                  "status" to "failed",
+                                                  "reason" to "Accessibility Service is not enabled",
+                                                  "uiDump" to "Accessibility Service disabled"
+                                              )
+                                          } else {
+                                              svc.captureLiveVisionFrame(forceAttachEvenIfUnchanged = forceAttach)
+                                          }
+                                      }
                                       "listInstalledApps" -> {
                                           listLaunchableApps()
                                       }
@@ -879,8 +1089,20 @@ jobs:
                                           svc?.captureScreenVision()
                                               ?: "Error: Accessibility Service is not enabled. Enable PocketStrike in Settings > Accessibility."
                                       }
+                                      "clickIndex" -> {
+                                          val index = (call.argument<Number>("index")?.toInt()) ?: -1
+                                          val svc = PocketStrikeAccessibilityService.instance
+                                          if (svc == null) {
+                                              "Error: Accessibility Service is not enabled."
+                                          } else {
+                                              val msg = svc.clickByIndex(index)
+                                              Thread.sleep(350)
+                                              msg
+                                          }
+                                      }
                                       "gameAction" -> {
                                           val stepsJson = call.argument<String>("stepsJson")
+                                          val targetIndex = (call.argument<Number>("targetIndex")?.toInt()) ?: -1
                                           val actionType = call.argument<String>("actionType") ?: "tap"
                                           val x = (call.argument<Number>("x")?.toFloat()) ?: 540f
                                           val y = (call.argument<Number>("y")?.toFloat()) ?: 1200f
@@ -889,33 +1111,35 @@ jobs:
                                           val secondX = (call.argument<Number>("secondX")?.toFloat()) ?: 850f
                                           val secondY = (call.argument<Number>("secondY")?.toFloat()) ?: 1600f
                                           val durationMs = (call.argument<Number>("durationMs")?.toLong()) ?: 65L
-                                          val captureAfter = call.argument<Boolean>("captureAfter") ?: true
+                                          val captureAfter = call.argument<Boolean>("captureAfter") ?: false
 
                                           val svc = PocketStrikeAccessibilityService.instance
                                           if (svc == null) {
                                               "Error: Accessibility Service is not enabled."
                                           } else {
-                                              val status = if (!stepsJson.isNullOrBlank()) {
-                                                  svc.performGameBatch(stepsJson)
-                                              } else {
-                                                  val ok = svc.performGameAction(
-                                                      actionType = actionType,
-                                                      x = x,
-                                                      y = y,
-                                                      endX = endX,
-                                                      endY = endY,
-                                                      secondX = secondX,
-                                                      secondY = secondY,
-                                                      durationMs = durationMs
-                                                  )
-                                                  if (ok) {
-                                                      "Executed game_action '$actionType' at (${x.toInt()}, ${y.toInt()})."
-                                                  } else {
-                                                      "Game action '$actionType' failed."
+                                              val status = when {
+                                                  !stepsJson.isNullOrBlank() -> svc.performGameBatch(stepsJson)
+                                                  targetIndex > 0 -> svc.clickByIndex(targetIndex)
+                                                  else -> {
+                                                      val ok = svc.performGameAction(
+                                                          actionType = actionType,
+                                                          x = x,
+                                                          y = y,
+                                                          endX = endX,
+                                                          endY = endY,
+                                                          secondX = secondX,
+                                                          secondY = secondY,
+                                                          durationMs = durationMs
+                                                      )
+                                                      if (ok) {
+                                                          "Executed game_action '$actionType' at (${x.toInt()}, ${y.toInt()})."
+                                                      } else {
+                                                          "Game action '$actionType' failed."
+                                                      }
                                                   }
                                               }
+                                              Thread.sleep(380)
                                               if (captureAfter) {
-                                                  Thread.sleep(350)
                                                   "$status\n\n" + svc.captureScreenVision()
                                               } else {
                                                   status
@@ -933,6 +1157,7 @@ jobs:
                                           if (svc == null) {
                                               "Error: Accessibility Service is not enabled."
                                           } else if (svc.clickByText(target)) {
+                                              Thread.sleep(350)
                                               "Clicked element matching '$target'."
                                           } else {
                                               "Could not find or click element matching '$target'."
@@ -945,6 +1170,7 @@ jobs:
                                           if (svc == null) {
                                               "Error: Accessibility Service is not enabled."
                                           } else if (svc.tapCoordinates(x, y)) {
+                                              Thread.sleep(350)
                                               "Tapped coordinates ($x, $y)."
                                           } else {
                                               "Failed to tap coordinates ($x, $y)."
@@ -958,6 +1184,7 @@ jobs:
                                           if (svc == null) {
                                               "Error: Accessibility Service is not enabled."
                                           } else if (svc.inputText(text, target, submit)) {
+                                              Thread.sleep(350)
                                               val suffix = if (submit) " and submitted" else ""
                                               "Typed '$text'$suffix."
                                           } else {
@@ -974,6 +1201,7 @@ jobs:
                                           if (svc == null) {
                                               "Error: Accessibility Service is not enabled."
                                           } else if (svc.swipe(startX, startY, endX, endY, duration)) {
+                                              Thread.sleep(350)
                                               "Swiped from ($startX, $startY) to ($endX, $endY)."
                                           } else {
                                               "Swipe gesture failed."
@@ -985,6 +1213,7 @@ jobs:
                                           if (svc == null) {
                                               "Error: Accessibility Service is not enabled."
                                           } else if (svc.performGlobal(action)) {
+                                              Thread.sleep(350)
                                               "Executed system action: $action"
                                           } else {
                                               "Failed to execute system action: $action"
@@ -1131,7 +1360,6 @@ jobs:
           }
           EOF_MAIN_KT
 
-          # 7. Write clean AndroidManifest.xml
           cat << 'EOF_MANIFEST' > android/app/src/main/AndroidManifest.xml
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET"/>
@@ -1236,7 +1464,6 @@ jobs:
           </manifest>
           EOF_MANIFEST
 
-          # 8. Write clean android_automation_tools.dart
           mkdir -p lib/features/agent/data
           cat << 'EOF_AUTO_DART' > lib/features/agent/data/android_automation_tools.dart
           import 'dart:convert';
@@ -1269,7 +1496,7 @@ jobs:
             static AgentTool seeScreen() => AgentTool(
                   name: 'see_screen',
                   description:
-                      'Human Eye Vision (العين البشرية): Captures the live phone screen in real time (including fullscreen Android games, Unity/OpenGL graphics, and apps), sends the live frame to Vision models, and returns an On-Device Visual Radar with exact (x, y) coordinates of buttons, targets, and game zones.',
+                      'Captures a fresh screenshot of the current phone screen on demand with ARTEMIS Set-of-Mark [#index] badges, calibrated (x,y) coordinate grid, UI dump, and Visual Radar. Note: When Live Screen Vision is ON, a fresh frame is already attached automatically each turn — only call this if you need an explicit manual refresh.',
                   inputSchema: const {
                     'type': 'object',
                     'properties': <String, dynamic>{},
@@ -1288,18 +1515,19 @@ jobs:
             static AgentTool gameAction() => AgentTool(
                   name: 'game_action',
                   description:
-                      'Executes real-time Android game moves at screen coordinates (x, y). IMPORTANT: Whenever multiple moves/taps are visible on screen (e.g. matching 3 or 9 cars/tiles in a puzzle), ALWAYS pass all moves together in the "steps" array so they execute in ONE fast batch without extra round-trips!',
+                      'ARTEMIS Action Burst & Game Controller: Executes single or batched moves ("steps") by element index ("target_index": 1) or screen coordinates (x, y). Whenever multiple moves are visible (e.g. matching 3 or 9 cars/tiles), pass ALL moves together in the "steps" array so they execute in ONE fast burst!',
                   inputSchema: const {
                     'type': 'object',
                     'properties': {
                       'steps': {
                         'type': 'array',
                         'description':
-                            'PREFERRED FOR FAST GAMEPLAY: List of sequential moves to execute in one batch (e.g. [{"action_type":"tap","x":360,"y":900,"wait_ms":350}, {"action_type":"tap","x":540,"y":1100,"wait_ms":350}]).',
+                            'PREFERRED FOR FAST ACTION BURSTS: List of sequential moves in one turn (e.g. [{"action_type":"tap","x":360,"y":900,"wait_ms":350}, {"action_type":"tap","target_index":2,"wait_ms":350}]).',
                         'items': {
                           'type': 'object',
                           'properties': {
                             'action_type': {'type': 'string'},
+                            'target_index': {'type': 'number'},
                             'x': {'type': 'number'},
                             'y': {'type': 'number'},
                             'end_x': {'type': 'number'},
@@ -1309,6 +1537,11 @@ jobs:
                           },
                         },
                       },
+                      'target_index': {
+                        'type': 'number',
+                        'description':
+                            'Optional ARTEMIS Set-of-Mark badge number (e.g. 1 for [#1]) to click directly.',
+                      },
                       'action_type': {
                         'type': 'string',
                         'description':
@@ -1316,11 +1549,11 @@ jobs:
                       },
                       'x': {
                         'type': 'number',
-                        'description': 'Primary X coordinate in pixels (read from the image coordinate grid).',
+                        'description': 'Primary X coordinate in pixels.',
                       },
                       'y': {
                         'type': 'number',
-                        'description': 'Primary Y coordinate in pixels (read from the image coordinate grid).',
+                        'description': 'Primary Y coordinate in pixels.',
                       },
                       'end_x': {
                         'type': 'number',
@@ -1342,11 +1575,6 @@ jobs:
                         'type': 'number',
                         'description': 'Gesture duration in milliseconds (default 65).',
                       },
-                      'capture_after': {
-                        'type': 'boolean',
-                        'description':
-                            'Whether to capture the updated screen frame after executing the move/batch (default: true).',
-                      },
                     },
                   },
                   risk: ToolRisk.safe,
@@ -1356,6 +1584,7 @@ jobs:
                     if (rawSteps is List && rawSteps.isNotEmpty) {
                       stepsJson = jsonEncode(rawSteps);
                     }
+                    final targetIndex = (args['target_index'] as num?)?.toInt() ?? -1;
                     final actionType = args['action_type'] as String? ?? 'tap';
                     final x = (args['x'] as num?)?.toDouble() ?? 540.0;
                     final y = (args['y'] as num?)?.toDouble() ?? 1200.0;
@@ -1364,10 +1593,10 @@ jobs:
                     final secondX = (args['second_x'] as num?)?.toDouble() ?? 850.0;
                     final secondY = (args['second_y'] as num?)?.toDouble() ?? 1600.0;
                     final durationMs = (args['duration_ms'] as num?)?.toInt() ?? 65;
-                    final captureAfter = args['capture_after'] as bool? ?? true;
                     try {
                       final res = await _channel.invokeMethod<String>('gameAction', {
                         'stepsJson': stepsJson,
+                        'targetIndex': targetIndex,
                         'actionType': actionType,
                         'x': x,
                         'y': y,
@@ -1376,7 +1605,7 @@ jobs:
                         'secondX': secondX,
                         'secondY': secondY,
                         'durationMs': durationMs,
-                        'captureAfter': captureAfter,
+                        'captureAfter': false,
                       });
                       return res ?? 'Executed game action';
                     } catch (e) {
@@ -1407,7 +1636,7 @@ jobs:
             static AgentTool openApp() => AgentTool(
                   name: 'open_app',
                   description:
-                      'Opens an installed Android application or game by its display name (Arabic or English, e.g. "YouTube", "يوتيوب", "Subway Surfers") or package name. Optionally accepts search_query.',
+                      'Opens an installed Android application or game by its display name (Arabic or English, e.g. "YouTube", "يوتيوب", "Car Match") or package name. Optionally accepts search_query.',
                   inputSchema: const {
                     'type': 'object',
                     'properties': {
@@ -1443,7 +1672,7 @@ jobs:
             static AgentTool getScreenElements() => AgentTool(
                   name: 'get_screen_elements',
                   description:
-                      'Reads the current phone screen via AccessibilityService and returns all visible buttons, text fields, labels, and their center (x, y) coordinates.',
+                      'Reads the current phone screen via AccessibilityService and returns all visible UI elements with their [#index] and exact center (x, y) coordinates.',
                   inputSchema: const {
                     'type': 'object',
                     'properties': <String, dynamic>{},
@@ -1462,14 +1691,14 @@ jobs:
             static AgentTool clickElement() => AgentTool(
                   name: 'click_element',
                   description:
-                      'Clicks a UI element or button on the phone screen matching its visible text, content description, or view ID (e.g. "Search", "بحث", "Play").',
+                      'Clicks a UI element on the phone screen by its ARTEMIS index (e.g. "#1" or "1") or by its visible text, content description, or view ID (e.g. "Search", "بحث").',
                   inputSchema: const {
                     'type': 'object',
                     'properties': {
                       'target': {
                         'type': 'string',
                         'description':
-                            'Visible text, description, or resource ID of the element to click.',
+                            'Element index (e.g. "#1") or visible text/description/ID of the element to click.',
                       },
                     },
                     'required': ['target'],
@@ -1491,7 +1720,7 @@ jobs:
             static AgentTool tapScreen() => AgentTool(
                   name: 'tap_screen',
                   description:
-                      'Taps the phone screen at exact pixel coordinates (x, y). Use see_screen or get_screen_elements first to find coordinates.',
+                      'Taps the phone screen at exact pixel coordinates (x, y).',
                   inputSchema: const {
                     'type': 'object',
                     'properties': {
@@ -1749,7 +1978,329 @@ jobs:
           }
           EOF_AUTO_DART
 
-          # 9. Write clean agent_tools_screen.dart (with Human Eye Vision & Game Player toggle)
+          cat << 'EOF_ENGINE_DART' > lib/features/agent/data/agent_engine.dart
+          import 'dart:convert';
+
+          import 'package:dio/dio.dart' show CancelToken;
+          import 'package:flutter/foundation.dart';
+          import 'package:flutter/services.dart';
+          import 'package:uuid/uuid.dart';
+
+          import '../../../core/models/chat_models.dart';
+          import '../../../shared/widgets/confirm_action_sheet.dart';
+          import '../../providers/domain/ai_provider.dart';
+          import '../domain/agent_event.dart';
+          import '../domain/agent_tool.dart';
+
+          /// ReAct-style agent loop enhanced with Google ARTEMIS 5-part architecture
+          /// and automatic Live Screen Vision injection.
+          class AgentEngine {
+            AgentEngine({this.maxSteps = 50});
+
+            static const _uuid = Uuid();
+            static const MethodChannel _visionChannel =
+                MethodChannel('com.pocketstrike/automation');
+
+            final int maxSteps;
+
+            /// Strips any `[SCREEN_VISION_IMAGE:...]` markers from earlier messages so
+            /// at most ONE image is ever attached to the outgoing request (on the last message),
+            /// and compresses older UI dumps (ARTEMIS Shared History Compression).
+            static List<ChatMessage> prepareMessagesWithSingleVisionAndCompression(
+              List<ChatMessage> rawMessages, {
+              String? liveVisionBlockForLastMessage,
+            }) {
+              final out = <ChatMessage>[];
+              for (var i = 0; i < rawMessages.length; i++) {
+                final m = rawMessages[i];
+                final isLast = i == rawMessages.length - 1;
+                var content = m.content;
+
+                if (!isLast) {
+                  // Strip any stored screenshot markers from older messages (Rule 4: ONE image per request, always)
+                  content = content.replaceAll(
+                    RegExp(r'\[SCREEN_VISION_IMAGE:[^\]]+\]'),
+                    '[earlier screenshot folded by ARTEMIS history compression]',
+                  );
+                  // Compress verbose UI dumps in older tool turns (> 2 steps old)
+                  if (m.role == MessageRole.tool && i < rawMessages.length - 3 && content.length > 600) {
+                    final lines = content.split('\n');
+                    final head = lines.take(6).join('\n');
+                    content = '$head\n... [ARTEMIS History Compressed: ${lines.length - 6} UI lines folded]';
+                  }
+                } else if (liveVisionBlockForLastMessage != null &&
+                    liveVisionBlockForLastMessage.isNotEmpty) {
+                  // Replace any stored screenshot on the last message with the fresh frame
+                  content = content.replaceAll(RegExp(r'\[SCREEN_VISION_IMAGE:[^\]]+\]'), '').trim();
+                  content = '$content\n\n$liveVisionBlockForLastMessage'.trim();
+                }
+
+                out.add(m.copyWith(content: content));
+              }
+              return out;
+            }
+
+            Future<String?> _captureLiveVisionForTurn(int step) async {
+              try {
+                if (step == 0) {
+                  await _visionChannel.invokeMethod('resetVisionSession');
+                }
+                final raw = await _visionChannel.invokeMethod<Map<Object?, Object?>>(
+                  'captureLiveVisionFrame',
+                  {'forceAttach': step == 0},
+                );
+                if (raw == null) {
+                  debugPrint('vision: capture failed: null channel response');
+                  return '[vision unavailable: capture failed (null response) — screenshot was NOT delivered to you this turn.]';
+                }
+                final status = raw['status'] as String? ?? 'failed';
+                final uiDump = raw['uiDump'] as String? ?? '';
+                final path = raw['path'] as String?;
+                final reason = raw['reason'] as String? ?? 'unknown';
+
+                switch (status) {
+                  case 'attached':
+                    debugPrint('vision: attached');
+                    return '[live vision: fresh screenshot attached | '
+                        'ARTEMIS Set-of-Mark [#index] & (x,y) Grid active]\n'
+                        '$uiDump\n'
+                        '[SCREEN_VISION_IMAGE:$path]';
+                  case 'unchanged':
+                    debugPrint('vision: skipped (frame unchanged)');
+                    final incidentWarn = step > 0
+                        ? '⚠️ ARTEMIS SAFETY NET INCIDENT: Screen did NOT change after your last action! '
+                            'Do NOT repeat the exact same tap/coordinates — adjust position or check the UI dump.'
+                        : 'Screen unchanged since last frame.';
+                    return '[live vision: skipped (frame unchanged) | $incidentWarn]\n$uiDump';
+                  default:
+                    debugPrint('vision: capture failed: $reason');
+                    return '[vision unavailable: capture failed ($reason) — screenshot was NOT delivered to you this turn. '
+                        'Work from the UI dump below:]\n$uiDump';
+                }
+              } catch (e) {
+                debugPrint('vision: capture failed: $e');
+                return null;
+              }
+            }
+
+            Stream<AgentEvent> run({
+              required AIProvider provider,
+              required List<ChatMessage> history,
+              required String model,
+              required GenerationParams params,
+              required List<AgentTool> tools,
+              required ConfirmationPolicy policy,
+              required Future<ConfirmResult> Function(
+                AgentTool tool,
+                ToolCallInfo call,
+              ) requestConfirmation,
+              Set<String> sessionApproved = const {},
+              Set<String> forceConfirm = const {},
+              CancelToken? cancelToken,
+              bool liveVisionEnabled = false,
+            }) async* {
+              final messages = List<ChatMessage>.from(history);
+              final approved = Set<String>.from(sessionApproved);
+              var cancelled = false;
+
+              for (var step = 0; step < maxSteps; step++) {
+                if (cancelToken?.isCancelled ?? false) {
+                  cancelled = true;
+                  break;
+                }
+
+                yield AgentStatusEvent(
+                  step == 0 ? 'Thinking…' : 'Thinking (step ${step + 1})…',
+                );
+
+                // Build outgoing request messages with optional automatic Live Screen Vision
+                String? liveVisionBlock;
+                if (liveVisionEnabled) {
+                  liveVisionBlock = await _captureLiveVisionForTurn(step);
+                }
+                final requestMessages = prepareMessagesWithSingleVisionAndCompression(
+                  messages,
+                  liveVisionBlockForLastMessage: liveVisionBlock,
+                );
+
+                final textBuffer = StringBuffer();
+                final toolCalls = <ToolCallInfo>[];
+                String? streamError;
+
+                await for (final event in provider.streamMessage(ChatRequest(
+                  messages: requestMessages,
+                  model: model,
+                  params: params,
+                  tools: tools.map((t) => t.toSpec()).toList(),
+                  cancelToken: cancelToken,
+                ))) {
+                  switch (event) {
+                    case TextDeltaEvent(:final text):
+                      textBuffer.write(text);
+                      yield AgentTextDeltaEvent(text);
+                    case SpeedMetricsEvent():
+                      break;
+                    case ToolCallsEvent(:final calls):
+                      toolCalls.addAll(calls);
+                    case UsageEvent(:final usage):
+                      yield AgentUsageEvent(usage);
+                    case StreamDoneEvent():
+                      break;
+                    case StreamErrorEvent(:final message):
+                      streamError = message;
+                  }
+                  if (cancelToken?.isCancelled ?? false) {
+                    cancelled = true;
+                    break;
+                  }
+                }
+
+                if (cancelled) break;
+
+                if (streamError != null) {
+                  yield AgentRunErrorEvent(streamError);
+                  break;
+                }
+
+                final assistantMessage = ChatMessage(
+                  id: _uuid.v4(),
+                  role: MessageRole.assistant,
+                  content: textBuffer.toString(),
+                  toolCalls: toolCalls,
+                  createdAt: DateTime.now(),
+                );
+                messages.add(assistantMessage);
+
+                // No tool calls -> final answer verified by Checker gate.
+                if (toolCalls.isEmpty) {
+                  yield AgentAssistantMessageEvent(assistantMessage);
+                  break;
+                }
+
+                yield AgentStatusEvent('Executing ${toolCalls.length} tool '
+                    'call${toolCalls.length > 1 ? 's' : ''}…');
+
+                for (final call in toolCalls) {
+                  if (cancelToken?.isCancelled ?? false) {
+                    cancelled = true;
+                    break;
+                  }
+
+                  yield AgentToolCallStartedEvent(call);
+                  final tool = tools
+                      .where((t) =>
+                          t.name == call.name ||
+                          t.name.endsWith('__${call.name}') ||
+                          call.name.endsWith('__${t.name}'))
+                      .firstOrNull;
+
+                  String observation;
+                  var isError = false;
+
+                  if (tool == null) {
+                    observation = 'Error: unknown tool "${call.name}".';
+                    isError = true;
+                  } else {
+                    final needsConfirm = !approved.contains(tool.name) &&
+                        (forceConfirm.contains(tool.name) ||
+                            switch (policy) {
+                              ConfirmationPolicy.alwaysAsk => true,
+                              ConfirmationPolicy.destructiveOnly =>
+                                tool.risk != ToolRisk.safe,
+                              ConfirmationPolicy.autonomous => false,
+                            });
+
+                    if (needsConfirm) {
+                      final decision = await requestConfirmation(tool, call);
+                      switch (decision) {
+                        case ConfirmResult.allowAlways:
+                          approved.add(tool.name);
+                        case ConfirmResult.allow:
+                          break;
+                        case ConfirmResult.deny:
+                          observation =
+                              'The user denied permission to run "${tool.name}". '
+                              'Do not retry; explain the limitation instead.';
+                          isError = true;
+                          yield AgentToolCallDeniedEvent(call);
+                          messages.add(ChatMessage(
+                            id: _uuid.v4(),
+                            role: MessageRole.tool,
+                            content: observation,
+                            toolCallId: call.id,
+                            toolName: call.name,
+                            createdAt: DateTime.now(),
+                          ));
+                          continue;
+                      }
+                    }
+
+                    try {
+                      final args = _decodeArgs(call.argumentsJson);
+                      observation = await tool.run(args);
+                    } catch (e) {
+                      observation = 'Error running ${tool.name}: $e';
+                      isError = true;
+                    }
+                  }
+
+                  yield AgentToolCallCompletedEvent(call, observation, isError);
+                  messages.add(ChatMessage(
+                    id: _uuid.v4(),
+                    role: MessageRole.tool,
+                    content: observation,
+                    toolCallId: call.id,
+                    toolName: call.name,
+                    createdAt: DateTime.now(),
+                  ));
+                }
+
+                if (cancelled) break;
+              }
+
+              if (!cancelled && messages.isNotEmpty && messages.last.role == MessageRole.tool) {
+                yield const AgentStatusEvent('Summarizing actions…');
+                final finalBuffer = StringBuffer();
+                try {
+                  final cleanFinalMsgs = prepareMessagesWithSingleVisionAndCompression(messages);
+                  await for (final event in provider.streamMessage(ChatRequest(
+                    messages: cleanFinalMsgs,
+                    model: model,
+                    params: params,
+                    tools: const [],
+                    cancelToken: cancelToken,
+                  ))) {
+                    if (event is TextDeltaEvent) {
+                      finalBuffer.write(event.text);
+                      yield AgentTextDeltaEvent(event.text);
+                    }
+                  }
+                  if (finalBuffer.isNotEmpty) {
+                    final summaryMessage = ChatMessage(
+                      id: _uuid.v4(),
+                      role: MessageRole.assistant,
+                      content: finalBuffer.toString(),
+                      createdAt: DateTime.now(),
+                    );
+                    yield AgentAssistantMessageEvent(summaryMessage);
+                  }
+                } catch (_) {}
+              }
+
+              yield AgentRunFinishedEvent(cancelled);
+            }
+
+            static Map<String, dynamic> _decodeArgs(String json) {
+              try {
+                final decoded = jsonDecode(json);
+                return decoded is Map<String, dynamic> ? decoded : const {};
+              } on FormatException {
+                return const {};
+              }
+            }
+          }
+          EOF_ENGINE_DART
+
           mkdir -p lib/features/settings/ui
           cat << 'EOF_SCREEN_DART' > lib/features/settings/ui/agent_tools_screen.dart
           import 'package:flutter/material.dart';
@@ -1770,7 +2321,7 @@ jobs:
             static const MethodChannel _automationChannel =
                 MethodChannel('com.pocketstrike/automation');
 
-            bool _enableHumanEye = true;
+            bool _enableLiveVision = true;
             bool _enableUiAutomation = true;
             bool _enableFilesystem = true;
             bool _enableWebSearch = true;
@@ -1782,7 +2333,7 @@ jobs:
             void initState() {
               super.initState();
               final prefs = ref.read(sharedPreferencesProvider);
-              _enableHumanEye = prefs.getBool('tool_human_eye') ?? true;
+              _enableLiveVision = prefs.getBool('tool_live_vision') ?? true;
               _enableUiAutomation = prefs.getBool('tool_ui_automation') ?? true;
               _enableFilesystem = prefs.getBool('tool_filesystem') ?? true;
               _enableWebSearch = prefs.getBool('tool_websearch') ?? true;
@@ -1834,20 +2385,20 @@ jobs:
                   children: [
                     _ToolSwitchTile(
                       icon: Icons.visibility_rounded,
-                      title: 'Human Eye Vision & Game Player',
+                      title: 'Live Screen Vision (ARTEMIS Eye)',
                       subtitle:
-                          'see_screen, game_action (Real-time screen vision, visual radar & multi-touch gaming)',
-                      value: _enableHumanEye,
+                          'When enabled, screenshots of your screen are sent to the configured AI provider.',
+                      value: _enableLiveVision,
                       onChanged: (v) {
-                        setState(() => _enableHumanEye = v);
-                        _update('tool_human_eye', v);
+                        setState(() => _enableLiveVision = v);
+                        _update('tool_live_vision', v);
                       },
                     ),
                     _ToolSwitchTile(
                       icon: AppIcons.smartphone,
-                      title: 'Phone UI & App Control',
+                      title: 'Phone UI & App Control (ARTEMIS Engine)',
                       subtitle:
-                          'open_app, click_element, tap_screen, type_text, swipe_screen, get_screen_elements',
+                          'open_app, game_action, click_element, tap_screen, type_text, swipe_screen, get_screen_elements',
                       value: _enableUiAutomation,
                       onChanged: (v) {
                         setState(() => _enableUiAutomation = v);
@@ -1876,8 +2427,8 @@ jobs:
                           Expanded(
                             child: Text(
                               _isAccessibilityGranted
-                                  ? 'Human Eye Vision & Accessibility active (Live Screen, Tap & Multi-Touch ready)'
-                                  : 'Accessibility permission required for Human Eye Vision, Tap & Swipe',
+                                  ? 'ARTEMIS Live Vision & Accessibility active (Set-of-Mark, Action Bursts & Safety Net ready)'
+                                  : 'Accessibility permission required for Live Screen Vision, Tap & Swipe',
                               style: TextStyle(color: tokens.textSecondary, fontSize: 13),
                             ),
                           ),
@@ -1975,20 +2526,20 @@ jobs:
           }
           EOF_SCREEN_DART
 
-          # 10. Write Multimodal Vision Providers (Gemini, Anthropic, OpenAI)
           mkdir -p lib/features/providers/data
           cat << 'EOF_GEMINI_DART' > lib/features/providers/data/gemini_provider.dart
           import 'dart:convert';
           import 'dart:io';
 
           import 'package:dio/dio.dart';
+          import 'package:flutter/foundation.dart';
 
           import '../../../core/models/chat_models.dart';
           import '../domain/ai_provider.dart';
           import '../domain/provider_types.dart';
           import 'sse_parser.dart';
 
-          /// Google Gemini client (`streamGenerateContent` over SSE).
+          /// Google Gemini client with Live Screen Vision and Honest Degradation.
           class GeminiProvider implements AIProvider {
             GeminiProvider({
               required this.configId,
@@ -2000,6 +2551,10 @@ jobs:
                         connectTimeout: const Duration(seconds: 20),
                         receiveTimeout: const Duration(minutes: 5),
                       ));
+
+            static const String honestDegradationNote =
+                '[vision unavailable: this endpoint rejected image content, so the screenshot was NOT delivered to you. '
+                'Do not claim to see it; work from text, or tell the user this model cannot receive images.]';
 
             @override
             final String configId;
@@ -2033,31 +2588,49 @@ jobs:
               return null;
             }
 
+            static String _stripVisionTag(String content) {
+              return content.replaceAll(RegExp(r'\[SCREEN_VISION_IMAGE:[^\]]+\]'), '').trim();
+            }
+
             @override
             Stream<ChatStreamEvent> streamMessage(ChatRequest request) async* {
-              final (system, contents) =
-                  convertMessages(request.messages, request.params.systemPrompt);
-              final body = <String, dynamic>{
-                'contents': contents,
-                if (system != null)
-                  'systemInstruction': {
-                    'parts': [
-                      {'text': system},
-                    ],
-                  },
-                'generationConfig': {
-                  'temperature': request.params.temperature,
-                  'topP': request.params.topP,
-                  'maxOutputTokens': request.params.maxTokens,
-                },
-                if (request.tools.isNotEmpty)
-                  'tools': [
-                    {'functionDeclarations': convertTools(request.tools)},
-                  ],
-              };
+              final lastMsg = request.messages.isNotEmpty ? request.messages.last : null;
+              final hasVisionImage =
+                  lastMsg != null && _extractVisionBytes(lastMsg.content) != null;
 
-              final Response<ResponseBody> response;
+              Map<String, dynamic> buildPayload({
+                required bool includeVision,
+                required bool appendDegradedNote,
+              }) {
+                final (system, contents) = convertMessages(
+                  request.messages,
+                  request.params.systemPrompt,
+                  includeVision: includeVision,
+                  appendDegradedNote: appendDegradedNote,
+                );
+                return <String, dynamic>{
+                  'contents': contents,
+                  if (system != null)
+                    'systemInstruction': {
+                      'parts': [
+                        {'text': system},
+                      ],
+                    },
+                  'generationConfig': {
+                    'temperature': request.params.temperature,
+                    'topP': request.params.topP,
+                    'maxOutputTokens': request.params.maxTokens,
+                  },
+                  if (request.tools.isNotEmpty)
+                    'tools': [
+                      {'functionDeclarations': convertTools(request.tools)},
+                    ],
+                };
+              }
+
+              Response<ResponseBody>? response;
               try {
+                final body = buildPayload(includeVision: true, appendDegradedNote: false);
                 response = await _dio.post<ResponseBody>(
                   '$baseUrl/v1beta/models/${request.model}:streamGenerateContent?alt=sse',
                   data: jsonEncode(body),
@@ -2072,11 +2645,32 @@ jobs:
                   yield const StreamDoneEvent();
                   return;
                 }
-                yield StreamErrorEvent(dioErrorMessage(e));
-                return;
+                final statusCode = e.response?.statusCode ?? 0;
+                if (hasVisionImage && statusCode >= 400 && statusCode < 500) {
+                  debugPrint('vision: degraded to text (endpoint rejected images)');
+                  try {
+                    final fallbackBody =
+                        buildPayload(includeVision: false, appendDegradedNote: true);
+                    response = await _dio.post<ResponseBody>(
+                      '$baseUrl/v1beta/models/${request.model}:streamGenerateContent?alt=sse',
+                      data: jsonEncode(fallbackBody),
+                      options: Options(
+                        headers: _headers,
+                        responseType: ResponseType.stream,
+                      ),
+                      cancelToken: request.cancelToken,
+                    );
+                  } on DioException catch (retryErr) {
+                    yield StreamErrorEvent(dioErrorMessage(retryErr));
+                    return;
+                  }
+                } else {
+                  yield StreamErrorEvent(dioErrorMessage(e));
+                  return;
+                }
               }
 
-              final body1 = response.data;
+              final body1 = response?.data;
               if (body1 == null) {
                 yield const StreamErrorEvent('Empty response body');
                 return;
@@ -2123,8 +2717,10 @@ jobs:
 
             static (String?, List<Map<String, dynamic>>) convertMessages(
               List<ChatMessage> messages,
-              String? extraSystemPrompt,
-            ) {
+              String? extraSystemPrompt, {
+              bool includeVision = true,
+              bool appendDegradedNote = false,
+            }) {
               final systemParts = <String>[
                 if (extraSystemPrompt != null && extraSystemPrompt.isNotEmpty)
                   extraSystemPrompt,
@@ -2135,7 +2731,14 @@ jobs:
               final out = <Map<String, dynamic>>[];
               for (var i = 0; i < messages.length; i++) {
                 final m = messages[i];
-                final isRecent = i >= messages.length - 2;
+                final isLast = i == messages.length - 1;
+                final visionBytes =
+                    (isLast && includeVision) ? _extractVisionBytes(m.content) : null;
+                var textContent = _stripVisionTag(m.content);
+                if (isLast && appendDegradedNote) {
+                  textContent = '$textContent\n$honestDegradationNote'.trim();
+                }
+
                 switch (m.role) {
                   case MessageRole.system:
                     break;
@@ -2143,14 +2746,21 @@ jobs:
                     out.add({
                       'role': 'user',
                       'parts': [
-                        {'text': m.content},
+                        if (visionBytes != null)
+                          {
+                            'inlineData': {
+                              'mimeType': 'image/jpeg',
+                              'data': base64Encode(visionBytes),
+                            },
+                          },
+                        {'text': textContent},
                       ],
                     });
                   case MessageRole.assistant:
                     out.add({
                       'role': 'model',
                       'parts': [
-                        if (m.content.isNotEmpty) {'text': m.content},
+                        if (textContent.isNotEmpty) {'text': textContent},
                         for (final call in m.toolCalls)
                           {
                             'functionCall': {
@@ -2161,14 +2771,13 @@ jobs:
                       ],
                     });
                   case MessageRole.tool:
-                    final visionBytes = isRecent ? _extractVisionBytes(m.content) : null;
                     out.add({
                       'role': 'user',
                       'parts': [
                         {
                           'functionResponse': {
                             'name': m.toolName ?? '',
-                            'response': {'result': m.content},
+                            'response': {'result': textContent},
                           },
                         },
                         if (visionBytes != null)
@@ -2236,13 +2845,14 @@ jobs:
           import 'dart:io';
 
           import 'package:dio/dio.dart';
+          import 'package:flutter/foundation.dart';
 
           import '../../../core/models/chat_models.dart';
           import '../domain/ai_provider.dart';
           import '../domain/provider_types.dart';
           import 'sse_parser.dart';
 
-          /// Anthropic Messages API client (SSE streaming, tool_use blocks).
+          /// Anthropic Messages API client with Live Screen Vision and Honest Degradation.
           class AnthropicProvider implements AIProvider {
             AnthropicProvider({
               required this.configId,
@@ -2256,6 +2866,9 @@ jobs:
                       ));
 
             static const _apiVersion = '2023-06-01';
+            static const String honestDegradationNote =
+                '[vision unavailable: this endpoint rejected image content, so the screenshot was NOT delivered to you. '
+                'Do not claim to see it; work from text, or tell the user this model cannot receive images.]';
 
             @override
             final String configId;
@@ -2294,23 +2907,41 @@ jobs:
               return null;
             }
 
+            static String _stripVisionTag(String content) {
+              return content.replaceAll(RegExp(r'\[SCREEN_VISION_IMAGE:[^\]]+\]'), '').trim();
+            }
+
             @override
             Stream<ChatStreamEvent> streamMessage(ChatRequest request) async* {
-              final (system, messages) =
-                  convertMessages(request.messages, request.params.systemPrompt);
-              final body = <String, dynamic>{
-                'model': request.model,
-                'messages': messages,
-                if (system != null) 'system': system,
-                'max_tokens': request.params.maxTokens,
-                'temperature': request.params.temperature,
-                'top_p': request.params.topP,
-                'stream': true,
-                if (request.tools.isNotEmpty) 'tools': convertTools(request.tools),
-              };
+              final lastMsg = request.messages.isNotEmpty ? request.messages.last : null;
+              final hasVisionImage =
+                  lastMsg != null && _extractVisionBytes(lastMsg.content) != null;
 
-              final Response<ResponseBody> response;
+              Map<String, dynamic> buildPayload({
+                required bool includeVision,
+                required bool appendDegradedNote,
+              }) {
+                final (system, messages) = convertMessages(
+                  request.messages,
+                  request.params.systemPrompt,
+                  includeVision: includeVision,
+                  appendDegradedNote: appendDegradedNote,
+                );
+                return <String, dynamic>{
+                  'model': request.model,
+                  'messages': messages,
+                  if (system != null) 'system': system,
+                  'max_tokens': request.params.maxTokens,
+                  'temperature': request.params.temperature,
+                  'top_p': request.params.topP,
+                  'stream': true,
+                  if (request.tools.isNotEmpty) 'tools': convertTools(request.tools),
+                };
+              }
+
+              Response<ResponseBody>? response;
               try {
+                final body = buildPayload(includeVision: true, appendDegradedNote: false);
                 response = await _dio.post<ResponseBody>(
                   '$baseUrl/v1/messages',
                   data: jsonEncode(body),
@@ -2325,11 +2956,32 @@ jobs:
                   yield const StreamDoneEvent();
                   return;
                 }
-                yield StreamErrorEvent(dioErrorMessage(e));
-                return;
+                final statusCode = e.response?.statusCode ?? 0;
+                if (hasVisionImage && statusCode >= 400 && statusCode < 500) {
+                  debugPrint('vision: degraded to text (endpoint rejected images)');
+                  try {
+                    final fallbackBody =
+                        buildPayload(includeVision: false, appendDegradedNote: true);
+                    response = await _dio.post<ResponseBody>(
+                      '$baseUrl/v1/messages',
+                      data: jsonEncode(fallbackBody),
+                      options: Options(
+                        headers: _headers,
+                        responseType: ResponseType.stream,
+                      ),
+                      cancelToken: request.cancelToken,
+                    );
+                  } on DioException catch (retryErr) {
+                    yield StreamErrorEvent(dioErrorMessage(retryErr));
+                    return;
+                  }
+                } else {
+                  yield StreamErrorEvent(dioErrorMessage(e));
+                  return;
+                }
               }
 
-              final body1 = response.data;
+              final body1 = response?.data;
               if (body1 == null) {
                 yield const StreamErrorEvent('Empty response body');
                 return;
@@ -2407,8 +3059,10 @@ jobs:
 
             static (String?, List<Map<String, dynamic>>) convertMessages(
               List<ChatMessage> messages,
-              String? extraSystemPrompt,
-            ) {
+              String? extraSystemPrompt, {
+              bool includeVision = true,
+              bool appendDegradedNote = false,
+            }) {
               final systemParts = <String>[
                 if (extraSystemPrompt != null && extraSystemPrompt.isNotEmpty)
                   extraSystemPrompt,
@@ -2419,17 +3073,41 @@ jobs:
               final out = <Map<String, dynamic>>[];
               for (var i = 0; i < messages.length; i++) {
                 final m = messages[i];
-                final isRecent = i >= messages.length - 2;
+                final isLast = i == messages.length - 1;
+                final visionBytes =
+                    (isLast && includeVision) ? _extractVisionBytes(m.content) : null;
+                var textContent = _stripVisionTag(m.content);
+                if (isLast && appendDegradedNote) {
+                  textContent = '$textContent\n$honestDegradationNote'.trim();
+                }
+
                 switch (m.role) {
                   case MessageRole.system:
                     break;
                   case MessageRole.user:
-                    out.add({'role': 'user', 'content': m.content});
+                    if (visionBytes != null) {
+                      out.add({
+                        'role': 'user',
+                        'content': [
+                          {
+                            'type': 'image',
+                            'source': {
+                              'type': 'base64',
+                              'media_type': 'image/jpeg',
+                              'data': base64Encode(visionBytes),
+                            },
+                          },
+                          {'type': 'text', 'text': textContent},
+                        ],
+                      });
+                    } else {
+                      out.add({'role': 'user', 'content': textContent});
+                    }
                   case MessageRole.assistant:
                     out.add({
                       'role': 'assistant',
                       'content': [
-                        if (m.content.isNotEmpty) {'type': 'text', 'text': m.content},
+                        if (textContent.isNotEmpty) {'type': 'text', 'text': textContent},
                         for (final call in m.toolCalls)
                           {
                             'type': 'tool_use',
@@ -2440,7 +3118,6 @@ jobs:
                       ],
                     });
                   case MessageRole.tool:
-                    final visionBytes = isRecent ? _extractVisionBytes(m.content) : null;
                     out.add({
                       'role': 'user',
                       'content': [
@@ -2448,7 +3125,6 @@ jobs:
                           'type': 'tool_result',
                           'tool_use_id': m.toolCallId,
                           'content': [
-                            {'type': 'text', 'text': m.content},
                             if (visionBytes != null)
                               {
                                 'type': 'image',
@@ -2458,6 +3134,7 @@ jobs:
                                   'data': base64Encode(visionBytes),
                                 },
                               },
+                            {'type': 'text', 'text': textContent},
                           ],
                         },
                       ],
@@ -2525,6 +3202,7 @@ jobs:
           import 'dart:io';
 
           import 'package:dio/dio.dart';
+          import 'package:flutter/foundation.dart';
 
           import '../../../core/models/chat_models.dart';
           import '../domain/ai_provider.dart';
@@ -2532,7 +3210,8 @@ jobs:
           import 'openai_streaming.dart';
           import 'sse_parser.dart';
 
-          /// OpenAI-compatible chat-completions client.
+          /// OpenAI-compatible chat-completions client with Live Screen Vision
+          /// and Honest Degradation support.
           class OpenAiCompatibleProvider implements AIProvider {
             OpenAiCompatibleProvider({
               required this.configId,
@@ -2545,6 +3224,10 @@ jobs:
                         connectTimeout: const Duration(seconds: 20),
                         receiveTimeout: const Duration(minutes: 5),
                       ));
+
+            static const String honestDegradationNote =
+                '[vision unavailable: this endpoint rejected image content, so the screenshot was NOT delivered to you. '
+                'Do not claim to see it; work from text, or tell the user this model cannot receive images.]';
 
             @override
             final String configId;
@@ -2597,22 +3280,51 @@ jobs:
               return null;
             }
 
+            static String _stripVisionTag(String content) {
+              return content.replaceAll(RegExp(r'\[SCREEN_VISION_IMAGE:[^\]]+\]'), '').trim();
+            }
+
+            /// Converts internal messages into OpenAI wire format.
+            /// Attaches at most ONE image on the LAST user or tool message.
             static List<Map<String, dynamic>> convertMessages(
-              List<ChatMessage> messages,
-            ) {
+              List<ChatMessage> messages, {
+              bool includeVision = true,
+              bool appendDegradedNote = false,
+            }) {
               final result = <Map<String, dynamic>>[];
               for (var i = 0; i < messages.length; i++) {
                 final m = messages[i];
-                final isLatest = i == messages.length - 1;
+                final isLast = i == messages.length - 1;
+                final visionBytes = (isLast && includeVision) ? _extractVisionBytes(m.content) : null;
+                var textContent = _stripVisionTag(m.content);
+                if (isLast && appendDegradedNote) {
+                  textContent = '$textContent\n$honestDegradationNote'.trim();
+                }
+
                 switch (m.role) {
                   case MessageRole.system:
-                    result.add({'role': 'system', 'content': m.content});
+                    result.add({'role': 'system', 'content': textContent});
                   case MessageRole.user:
-                    result.add({'role': 'user', 'content': m.content});
+                    if (visionBytes != null) {
+                      result.add({
+                        'role': 'user',
+                        'content': [
+                          {'type': 'text', 'text': textContent},
+                          {
+                            'type': 'image_url',
+                            'image_url': {
+                              'url': 'data:image/jpeg;base64,${base64Encode(visionBytes)}',
+                            },
+                          },
+                        ],
+                      });
+                    } else {
+                      result.add({'role': 'user', 'content': textContent});
+                    }
                   case MessageRole.assistant:
                     result.add({
                       'role': 'assistant',
-                      'content': m.content.isEmpty ? null : m.content,
+                      'content': textContent.isEmpty ? null : textContent,
                       if (m.toolCalls.isNotEmpty)
                         'tool_calls': [
                           for (final call in m.toolCalls)
@@ -2631,27 +3343,21 @@ jobs:
                       'role': 'tool',
                       'tool_call_id': m.toolCallId,
                       if (m.toolName != null) 'name': m.toolName,
-                      'content': m.content,
+                      'content': textContent,
                     });
-                    if (isLatest) {
-                      final visionBytes = _extractVisionBytes(m.content);
-                      if (visionBytes != null) {
-                        result.add({
-                          'role': 'user',
-                          'content': [
-                            {
-                              'type': 'text',
-                              'text': 'Live phone screen frame captured by Human Eye:',
+                    if (visionBytes != null) {
+                      result.add({
+                        'role': 'user',
+                        'content': [
+                          {'type': 'text', 'text': '[live vision: current screen frame]'},
+                          {
+                            'type': 'image_url',
+                            'image_url': {
+                              'url': 'data:image/jpeg;base64,${base64Encode(visionBytes)}',
                             },
-                            {
-                              'type': 'image_url',
-                              'image_url': {
-                                'url': 'data:image/jpeg;base64,${base64Encode(visionBytes)}',
-                              },
-                            },
-                          ],
-                        });
-                      }
+                          },
+                        ],
+                      });
                     }
                 }
               }
@@ -2674,11 +3380,18 @@ jobs:
               ];
             }
 
-            @override
-            Stream<ChatStreamEvent> streamMessage(ChatRequest request) async* {
-              final body = <String, dynamic>{
+            Map<String, dynamic> _buildBody(
+              ChatRequest request, {
+              required bool includeVision,
+              required bool appendDegradedNote,
+            }) {
+              return <String, dynamic>{
                 'model': request.model,
-                'messages': convertMessages(request.messages),
+                'messages': convertMessages(
+                  request.messages,
+                  includeVision: includeVision,
+                  appendDegradedNote: appendDegradedNote,
+                ),
                 'stream': true,
                 'temperature': request.params.temperature,
                 'top_p': request.params.topP,
@@ -2695,9 +3408,24 @@ jobs:
                   'tool_choice': 'auto',
                 },
               };
+            }
 
-              final Response<ResponseBody> response;
+            @override
+            Stream<ChatStreamEvent> streamMessage(ChatRequest request) async* {
+              final lastMsg = request.messages.isNotEmpty ? request.messages.last : null;
+              final hasVisionImage =
+                  lastMsg != null && _extractVisionBytes(lastMsg.content) != null;
+
+              Response<ResponseBody>? response;
               try {
+                final body = _buildBody(
+                  request,
+                  includeVision: supportsVision,
+                  appendDegradedNote: hasVisionImage && !supportsVision,
+                );
+                if (hasVisionImage && !supportsVision) {
+                  debugPrint('vision: degraded to text (endpoint rejected images)');
+                }
                 response = await _dio.post<ResponseBody>(
                   _chatCompletionsUrl,
                   data: jsonEncode(body),
@@ -2712,12 +3440,38 @@ jobs:
                   yield const StreamDoneEvent();
                   return;
                 }
-                final msg = await readDioErrorMessage(e);
-                yield StreamErrorEvent(msg);
-                return;
+                final statusCode = e.response?.statusCode ?? 0;
+                if (hasVisionImage && statusCode >= 400 && statusCode < 500) {
+                  // Honest degradation (Rule 5a): retry the SAME request once WITHOUT images
+                  debugPrint('vision: degraded to text (endpoint rejected images)');
+                  try {
+                    final fallbackBody = _buildBody(
+                      request,
+                      includeVision: false,
+                      appendDegradedNote: true,
+                    );
+                    response = await _dio.post<ResponseBody>(
+                      _chatCompletionsUrl,
+                      data: jsonEncode(fallbackBody),
+                      options: Options(
+                        headers: _headers,
+                        responseType: ResponseType.stream,
+                      ),
+                      cancelToken: request.cancelToken,
+                    );
+                  } on DioException catch (retryErr) {
+                    final msg = await readDioErrorMessage(retryErr);
+                    yield StreamErrorEvent(msg);
+                    return;
+                  }
+                } else {
+                  final msg = await readDioErrorMessage(e);
+                  yield StreamErrorEvent(msg);
+                  return;
+                }
               }
 
-              final body1 = response.data;
+              final body1 = response?.data;
               if (body1 == null) {
                 yield const StreamErrorEvent('Empty response body');
                 return;
@@ -2795,7 +3549,6 @@ jobs:
           }
           EOF_OPENAI_DART
 
-          # 11. Write updated Local Model Engine (with local tool calling support)
           mkdir -p lib/features/local_models/data
           cat << 'EOF_LOCAL_DART' > lib/features/local_models/data/local_model_engine.dart
           import 'dart:convert';
@@ -3267,18 +4020,36 @@ jobs:
                 await LocalLlamaNativeService.instance.clearContext();
               }
 
-              // Inject tool schemas for Local Agent tool-calling & Human Eye Game Control
-              final enrichedMessages = List<ChatMessage>.from(request.messages);
+              // Honest degradation for text-only local GGUF models + ARTEMIS tool schema injection
+              final enrichedMessages = <ChatMessage>[];
+              for (var i = 0; i < request.messages.length; i++) {
+                final m = request.messages[i];
+                if (m.content.contains('[SCREEN_VISION_IMAGE:')) {
+                  debugPrint('vision: degraded to text (endpoint rejected images)');
+                  final stripped = m.content
+                      .replaceAll(RegExp(r'\[SCREEN_VISION_IMAGE:[^\]]+\]'), '')
+                      .trim();
+                  enrichedMessages.add(
+                    m.copyWith(
+                      content: '$stripped\n[vision unavailable: this endpoint rejected image content, '
+                          'so the screenshot was NOT delivered to you. Do not claim to see it; '
+                          'work from text, or tell the user this model cannot receive images.]',
+                    ),
+                  );
+                } else {
+                  enrichedMessages.add(m);
+                }
+              }
+
               if (request.tools.isNotEmpty) {
                 const toolGuide =
-                    '\n\n[LOCAL AGENT TOOLS & HUMAN EYE VISION]\n'
-                    'To control the phone or play games, output a tool call block:\n'
+                    '\n\n[ARTEMIS LOCAL AGENT TOOLS]\n'
+                    'To act on the phone, output a tool call block:\n'
                     '<tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>\n'
-                    'Core tools:\n'
-                    '- see_screen: {} -> captures live screen & visual radar target coordinates (x,y)\n'
-                    '- game_action: {"action_type": "tap"|"double_tap"|"hold"|"joystick"|"multi_touch", "x": 540, "y": 1200, "end_x": 540, "end_y": 900, "duration_ms": 120}\n'
+                    'Tools:\n'
+                    '- game_action: {"steps": [{"action_type":"tap","target_index":1,"wait_ms":350}]} or {"action_type":"tap","x":540,"y":1200}\n'
                     '- open_app: {"app": "YouTube", "search_query": "..."}\n'
-                    '- click_element: {"target": "..."}\n'
+                    '- click_element: {"target": "#1" or "Search"}\n'
                     '- type_text: {"text": "...", "submit": true}\n'
                     '- swipe_screen: {"direction": "up"|"down"|"left"|"right"}\n';
                 final sysIdx = enrichedMessages.indexWhere((m) => m.role == MessageRole.system);
@@ -3393,7 +4164,6 @@ jobs:
                 );
               }
 
-              // Parse any <tool_call>{...}</tool_call> emitted by the local GGUF model
               if (request.tools.isNotEmpty) {
                 final match = RegExp(r'<tool_call>\s*(\{[\s\S]*?\})\s*</tool_call>')
                     .firstMatch(fullGeneratedText.toString());
@@ -4000,9 +4770,9 @@ jobs:
           }
           EOF_LOCAL_DART
 
-          # 12. Write updated Chat Controller (with Cloud + Local Agent Human Eye instructions)
           mkdir -p lib/features/chat/application
           cat << 'EOF_CHAT_CTRL_DART' > lib/features/chat/application/chat_controller.dart
+          import '../../../core/storage/prefs_provider.dart';
           import 'dart:convert';
 
           import 'package:dio/dio.dart';
@@ -4483,6 +5253,9 @@ jobs:
               var tokenCount = 0;
               double? lastTps;
 
+              final liveVisionOn =
+                  ref.read(sharedPreferencesProvider).getBool('tool_live_vision') ?? true;
+
               await for (final event in engine.run(
                 provider: provider,
                 history: history,
@@ -4493,6 +5266,7 @@ jobs:
                 sessionApproved: _sessionApprovedTools,
                 forceConfirm: forceConfirm,
                 cancelToken: _cancelToken,
+                liveVisionEnabled: liveVisionOn,
                 requestConfirmation: (tool, call) async {
                   final handler = confirmHandler;
                   if (handler == null) return ConfirmResult.deny;
@@ -4786,16 +5560,28 @@ jobs:
 
               if (state.agentMode || state.localMode) {
                 const agentImageInstruction =
-                    'You have full capabilities to generate images using the "generate_image" tool. When the user asks you to generate, create, draw, paint, design, or render an image, artwork, illustration, photo, or wallpaper, ALWAYS call the "generate_image" tool with a detailed, creative visual prompt and "1:1" aspect ratio unless specified otherwise.\n\n'
-                    'HUMAN EYE VISION & FAST BATCH ANDROID GAME CONTROL:\n'
-                    '1. Call "see_screen" to capture the live screen with a calibrated (x,y) coordinate grid drawn directly on the image.\n'
-                    '2. Read the exact (x,y) pixel coordinates of targets inside the central play arena from the yellow coordinate labels on the image. NEVER tap the top HUD corners (such as the Settings gear icon at top-right) unless explicitly asked.\n'
-                    '3. BATCH MOVES FOR SPEED: When multiple moves are visible (e.g. matching 3 or 9 cars/tiles), pass ALL moves together in ONE "game_action" call using the "steps" array (e.g. "steps": [{"action_type":"tap","x":360,"y":920,"wait_ms":380}, ...]).\n'
-                    '4. BRIEF LIVE UPDATES: Before each tool call, write ONLY ONE short sentence (1 line) telling the user what you are doing now.\n'
-                    '5. STRICT STOP CONDITION: Respect the exact scope of the user request! If the user asks to complete a specific level (e.g. "المستوى الأول فقط" / Level 1 only), as soon as the screen shows Level 1 is cleared or "Level 2" appears, STOP calling any tools immediately and send your final completion message!';
+                    'You have full capabilities to generate images using the "generate_image" tool. When the user asks you to generate, create, draw, paint, design, or render an image, artwork, illustration, photo, or wallpaper, ALWAYS call the "generate_image" tool with a detailed, creative visual prompt and "1:1" aspect ratio unless specified otherwise.';
                 systemPrompt = systemPrompt.isEmpty
                     ? agentImageInstruction
                     : '$systemPrompt\n\n$agentImageInstruction';
+
+                final liveVisionOn =
+                    ref.read(sharedPreferencesProvider).getBool('tool_live_vision') ?? true;
+                if (liveVisionOn) {
+                  const liveVisionAndArtemisContract = '''
+          ## Live Screen Vision & ARTEMIS 5-Part Execution Engine
+          [live vision: when an image is attached, it is a fresh automatic capture of the current screen — newer than any earlier screenshot. Trust exact coordinates from UI tree dumps over visual estimates; after acting, verify results on the next attached frame; if no image is attached this turn, you are text-only — never claim to see the screen.]
+
+          When Live Screen Vision is enabled, a fresh screenshot of the current screen is attached to your request automatically whenever the screen has changed. It appears with the marker "[live vision: ...]" and is your direct view of the device — always newer than any earlier screenshot in the conversation.
+
+          How to work with it (ARTEMIS 5-Part Protocol):
+          1. TRUST ORDER FOR TARGETING (Dynamic-First, Coordinate-Fallback): Exact coordinates and [#index] badges from the UI dump are always more precise than visual estimates. When the target exists in the dump, use its [#index] or exact coordinates. Use the live frame's calibrated yellow (x,y) coordinate grid and [#index] badges for targets the XML dump cannot see (games, canvases, maps, video) — state your action in ONE short line before acting, and NEVER tap top HUD Settings/Pause gear icons unless asked.
+          2. ACTION BURSTS (Batch Steps): When multiple moves are visible on screen (e.g. matching 3 or 9 cars/tiles in a game), pass ALL moves together in ONE "game_action" call using the "steps" array (e.g. "steps": [{"action_type":"tap","x":360,"y":920,"wait_ms":380}, ...]) to execute in a single burst.
+          3. ACT, THEN VERIFY & SAFETY NET: After each action, the next live frame tells you the result. If you see "⚠️ ARTEMIS SAFETY NET INCIDENT: Screen did NOT change", never repeat the same coordinates — adjust immediately.
+          4. BE HONEST ABOUT WHAT YOU SEE: If this message has no image attached, you are text-only this turn — never describe or claim to see the screen. If you find "[vision unavailable ... NOT delivered]", say briefly that you cannot see the screen this turn and work from the UI dump.
+          5. EFFICIENCY & STRICT CHECKER STOP GATE: When a live frame is already attached, do NOT call "see_screen" just to look — act directly. As soon as the live frame shows the user's requested goal or level is completed (e.g. user asked for Level 1 only and Level 1 is cleared or Level 2 appears), STOP calling tools immediately and report completion!''';
+                  systemPrompt = '$systemPrompt\n\n$liveVisionAndArtemisContract';
+                }
               }
 
               if (systemPrompt.isNotEmpty) {
@@ -4864,8 +5650,138 @@ jobs:
           });
           EOF_CHAT_CTRL_DART
 
+          mkdir -p test
+          cat << 'EOF_TEST_DART' > test/live_screen_vision_test.dart
+          import 'dart:convert';
+          import 'dart:io';
+
+          import 'package:flutter_test/flutter_test.dart';
+          import 'package:pocketstrike/core/models/chat_models.dart';
+          import 'package:pocketstrike/features/agent/data/agent_engine.dart';
+          import 'package:pocketstrike/features/providers/data/anthropic_provider.dart';
+          import 'package:pocketstrike/features/providers/data/gemini_provider.dart';
+          import 'package:pocketstrike/features/providers/data/openai_compatible_provider.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          void main() {
+            group('Live Screen Vision & ARTEMIS Engine Acceptance Tests', () {
+              test('1. Toggle persists across restart and after saving unrelated settings', () async {
+                SharedPreferences.setMockInitialValues({});
+                final prefs = await SharedPreferences.getInstance();
+
+                await prefs.setBool('tool_live_vision', true);
+                expect(prefs.getBool('tool_live_vision'), isTrue);
+
+                // Save unrelated settings and verify tool_live_vision does not revert
+                await prefs.setBool('tool_filesystem', false);
+                await prefs.setBool('tool_websearch', true);
+                expect(prefs.getBool('tool_live_vision'), isTrue);
+
+                await prefs.setBool('tool_live_vision', false);
+                await prefs.setBool('tool_calculator', true);
+                expect(prefs.getBool('tool_live_vision'), isFalse);
+              });
+
+              test('2. Single-image replacement & ARTEMIS history compression', () {
+                final msgs = [
+                  const ChatMessage(
+                    id: '1',
+                    role: MessageRole.user,
+                    content: 'Play Car Match [SCREEN_VISION_IMAGE:/tmp/old_frame_1.jpg]',
+                  ),
+                  const ChatMessage(
+                    id: '2',
+                    role: MessageRole.tool,
+                    toolCallId: 'c1',
+                    toolName: 'game_action',
+                    content: 'Step 1 [SCREEN_VISION_IMAGE:/tmp/old_frame_2.jpg]',
+                  ),
+                ];
+
+                final prepared = AgentEngine.prepareMessagesWithSingleVisionAndCompression(
+                  msgs,
+                  liveVisionBlockForLastMessage:
+                      '[live vision: fresh]\n[SCREEN_VISION_IMAGE:/tmp/new_frame_3.jpg]',
+                );
+
+                expect(prepared.first.content.contains('SCREEN_VISION_IMAGE'), isFalse);
+                expect(prepared.last.content.contains('/tmp/old_frame_2.jpg'), isFalse);
+                expect(prepared.last.content.contains('/tmp/new_frame_3.jpg'), isTrue);
+              });
+
+              test('3. Attach shape: image lands on LAST message only in OpenAI, Anthropic & Gemini', () {
+                final tmpFile = File('${Directory.systemTemp.path}/test_vision_frame.jpg');
+                tmpFile.writeAsBytesSync([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]);
+                addTearDown(() {
+                  if (tmpFile.existsSync()) tmpFile.deleteSync();
+                });
+
+                final conversation = [
+                  ChatMessage(
+                    id: 'm1',
+                    role: MessageRole.user,
+                    content: 'First turn [SCREEN_VISION_IMAGE:${tmpFile.path}]',
+                  ),
+                  const ChatMessage(
+                    id: 'm2',
+                    role: MessageRole.assistant,
+                    content: 'Thinking',
+                  ),
+                  ChatMessage(
+                    id: 'm3',
+                    role: MessageRole.user,
+                    content: 'Second turn [SCREEN_VISION_IMAGE:${tmpFile.path}]',
+                  ),
+                ];
+
+                // OpenAI wire format check
+                final oaMsgs = OpenAiCompatibleProvider.convertMessages(conversation);
+                expect(oaMsgs.first['content'], isA<String>()); // First message has NO image
+                final lastOaContent = oaMsgs.last['content'] as List;
+                expect(lastOaContent.any((p) => (p as Map)['type'] == 'image_url'), isTrue);
+
+                // Anthropic wire format check (image is FIRST content block on last user message)
+                final (_, anthMsgs) = AnthropicProvider.convertMessages(conversation, null);
+                expect(anthMsgs.first['content'], isA<String>());
+                final lastAnthContent = anthMsgs.last['content'] as List;
+                expect((lastAnthContent.first as Map)['type'], equals('image'));
+
+                // Gemini wire format check
+                final (_, gemMsgs) = GeminiProvider.convertMessages(conversation, null);
+                final firstGemParts = gemMsgs.first['parts'] as List;
+                expect(firstGemParts.any((p) => (p as Map).containsKey('inlineData')), isFalse);
+                final lastGemParts = gemMsgs.last['parts'] as List;
+                expect(lastGemParts.any((p) => (p as Map).containsKey('inlineData')), isTrue);
+              });
+
+              test('4. Honest degradation ladder appends mandatory text note when vision disabled/rejected', () {
+                final conversation = [
+                  const ChatMessage(
+                    id: 'm1',
+                    role: MessageRole.user,
+                    content: 'Check screen',
+                  ),
+                ];
+                final degraded = OpenAiCompatibleProvider.convertMessages(
+                  conversation,
+                  includeVision: false,
+                  appendDegradedNote: true,
+                );
+                final text = jsonEncode(degraded);
+                expect(
+                  text.contains('vision unavailable: this endpoint rejected image content'),
+                  isTrue,
+                );
+              });
+            });
+          }
+          EOF_TEST_DART
+
       - name: Install Flutter Dependencies
         run: flutter pub get
+
+      - name: Run Live Screen Vision & ARTEMIS Unit Tests
+        run: flutter test test/live_screen_vision_test.dart
 
       - name: Build Release APK
         run: flutter build apk --release --no-tree-shake-icons
