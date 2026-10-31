@@ -33,7 +33,7 @@ jobs:
           channel: 'stable'
           cache: true
 
-      - name: Auto-Apply ARTEMIS 5-Part Engine & Live Screen Vision
+      - name: Auto-Apply Fast Human Eye Vision & Game Engine
         run: |
           if [ ! -f pubspec.yaml ] && [ -f PocketStrike-main/pubspec.yaml ]; then
             shopt -s dotglob
@@ -90,7 +90,6 @@ jobs:
           import java.io.File
           import java.io.FileOutputStream
           import java.security.MessageDigest
-          import java.util.concurrent.ConcurrentHashMap
           import java.util.concurrent.CountDownLatch
           import java.util.concurrent.TimeUnit
           import kotlin.math.abs
@@ -106,17 +105,6 @@ jobs:
                   var instance: PocketStrikeAccessibilityService? = null
                       private set
               }
-
-              data class IndexedTarget(
-                  val index: Int,
-                  val label: String,
-                  val centerX: Int,
-                  val centerY: Int,
-                  val bounds: Rect,
-                  val isUiNode: Boolean
-              )
-
-              private val indexedTargets = ConcurrentHashMap<Int, IndexedTarget>()
 
               @Volatile
               private var lastFrameHash: String = ""
@@ -145,179 +133,108 @@ jobs:
               }
 
               /**
-               * Captures a live frame with:
-               * 1. Minimum ~1s rate-limit throttle + automatic 1x retry on Android rate-limit error
-               * 2. MD5 pixel hash deduplication ("unchanged" vs "attached")
-               * 3. Downscaling so longest side <= 1280px, JPEG quality 65
-               * 4. ARTEMIS Set-of-Mark numbered badges [#1, #2...] + calibrated (x,y) grid
+               * Captures the live screen with the proven clean Calibrated (x, y) Coordinate Grid
+               * so Vision models read exact car/button coordinates directly from the image on the 1st try.
                */
-              fun captureLiveVisionFrame(forceAttachEvenIfUnchanged: Boolean = false): Map<String, Any?> {
+              fun captureScreenVision(): String {
                   val dm = resources.displayMetrics
                   val screenW = dm.widthPixels
                   val screenH = dm.heightPixels
-                  val orientation = if (screenW > screenH) "Landscape" else "Portrait"
+                  val orientation = if (screenW > screenH) "Landscape (Game Mode)" else "Portrait"
 
+                  val sb = StringBuilder()
                   val root = rootInActiveWindow
-                  val activePkg = root?.packageName?.toString() ?: "fullscreen_canvas_or_game"
+                  val activePkg = root?.packageName?.toString() ?: "unknown_or_fullscreen_game"
 
-                  // 1. Collect UI tree nodes first (ARTEMIS Dynamic-First / Trust Order Rule #1)
-                  val uiTargets = collectUiTargets(root, maxNodes = 40)
-                  indexedTargets.clear()
-                  for (t in uiTargets) {
-                      indexedTargets[t.index] = t
-                  }
+                  sb.appendLine("=== LIVE SCREEN VISION (${screenW}x${screenH} $orientation | App: $activePkg) ===")
+                  sb.appendLine(
+                      "COORDINATE GUIDE: Read real screen (x,y) pixel coordinates directly from the yellow grid labels drawn on the attached image."
+                  )
+                  sb.appendLine(
+                      "SAFETY & STOP CHECK: (1) NEVER tap Top-Right/Top-Left HUD corners (y < ${(screenH * 0.16).toInt()}) where Settings/Pause gear icons live. " +
+                          "(2) Check the current Level/screen state against the user's request: if the requested level or goal is already completed (e.g. user asked for Level 1 only and screen shows Victory or Level 2), STOP calling tools immediately and report completion!"
+                  )
 
-                  val uiDumpSb = StringBuilder()
-                  uiDumpSb.appendLine("Active App: $activePkg | Screen: ${screenW}x${screenH} ($orientation)")
-                  if (uiTargets.isEmpty()) {
-                      uiDumpSb.appendLine("UI Dump: [No standard XML nodes — custom Canvas/Game surface active]")
-                  } else {
-                      uiDumpSb.appendLine("UI Dump Elements (Trust these exact coordinates first):")
-                      for (t in uiTargets) {
-                          uiDumpSb.appendLine("  [#${t.index}] ${t.label} -> center=(${t.centerX}, ${t.centerY})")
-                      }
-                  }
+                  var capturedBitmap = takeScreenshotWithRetry()
 
-                  // 2. Capture screenshot via Android 11+ AccessibilityService.takeScreenshot with 1s throttle & 1x retry
-                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-                      Log.i(TAG, "vision: capture failed: API < 30")
-                      return mapOf(
-                          "status" to "failed",
-                          "reason" to "Android version < 11 does not support Accessibility takeScreenshot",
-                          "uiDump" to uiDumpSb.toString().trim(),
-                          "activePackage" to activePkg
-                      )
-                  }
-
-                  val now = System.currentTimeMillis()
-                  val elapsedSinceLast = now - lastCaptureTimeMs
-                  if (elapsedSinceLast in 1..999) {
+                  val bmp = capturedBitmap
+                  if (bmp != null) {
                       try {
-                          Thread.sleep(1000L - elapsedSinceLast)
-                      } catch (_: Exception) {}
-                  }
+                          // 1. Downscale so longest side <= 1024px, JPEG quality 68
+                          val maxDim = 1024
+                          val scale = min(1.0f, maxDim.toFloat() / max(bmp.width, bmp.height).toFloat())
+                          val targetW = max(1, (bmp.width * scale).toInt())
+                          val targetH = max(1, (bmp.height * scale).toInt())
+                          val scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
+                              .copy(Bitmap.Config.ARGB_8888, true)
 
-                  var rawBitmap = takeScreenshotOnce()
-                  if (rawBitmap == null) {
-                      // Respect Android accessibility screenshot rate limit and retry once after ~1.05s
-                      try {
-                          Thread.sleep(1050L)
-                      } catch (_: Exception) {}
-                      rawBitmap = takeScreenshotOnce()
-                  }
+                          // Check MD5 hash of clean frame to detect if last action failed to change screen
+                          val cleanBaos = ByteArrayOutputStream()
+                          scaled.compress(Bitmap.CompressFormat.JPEG, 65, cleanBaos)
+                          val newHash = md5Hex(cleanBaos.toByteArray())
+                          val wasUnchanged = (lastFrameHash.isNotEmpty() && newHash == lastFrameHash)
+                          lastFrameHash = newHash
 
-                  val bmp = rawBitmap
-                  if (bmp == null) {
-                      Log.i(TAG, "vision: capture failed: takeScreenshot returned null")
-                      return mapOf(
-                          "status" to "failed",
-                          "reason" to "takeScreenshot rate-limited or blocked by secure window",
-                          "uiDump" to uiDumpSb.toString().trim(),
-                          "activePackage" to activePkg
-                      )
-                  }
-
-                  try {
-                      // 3. Downscale so longest side <= 1280px
-                      val maxDim = 1280
-                      val scale = min(1.0f, maxDim.toFloat() / max(bmp.width, bmp.height).toFloat())
-                      val targetW = max(1, (bmp.width * scale).toInt())
-                      val targetH = max(1, (bmp.height * scale).toInt())
-                      val scaledClean = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
-
-                      // Encode clean frame at JPEG quality 65 to compute deterministic MD5 frame hash
-                      val cleanBaos = ByteArrayOutputStream()
-                      scaledClean.compress(Bitmap.CompressFormat.JPEG, 65, cleanBaos)
-                      val cleanBytes = cleanBaos.toByteArray()
-                      val frameHash = md5Hex(cleanBytes)
-
-                      // 4. Run On-Device Visual Radar for Canvas/Game targets & append to indexedTargets
-                      val radarSb = StringBuilder()
-                      val radarTargets = analyzeBitmapForGames(
-                          bmp = scaledClean,
-                          screenW = screenW,
-                          screenH = screenH,
-                          startIndex = uiTargets.size + 1
-                      )
-                      if (radarTargets.isNotEmpty()) {
-                          radarSb.appendLine("Visual Radar Targets (Game/Canvas Hotspots):")
-                          for (rt in radarTargets) {
-                              indexedTargets[rt.index] = rt
-                              radarSb.appendLine("  [#${rt.index}] ${rt.label} -> center=(${rt.centerX}, ${rt.centerY})")
+                          if (wasUnchanged) {
+                              sb.appendLine(
+                                  "⚠️ SAFETY NET NOTICE: The screen pixels did NOT change after the previous action (or tutorial overlay is waiting). " +
+                                      "Check the exact (x,y) position of the car/button on the yellow grid and tap its center!"
+                              )
                           }
-                      }
 
-                      val fullSummary = (uiDumpSb.toString() + "\n" + radarSb.toString()).trim()
+                          // 2. Run On-Device Visual Radar (for text-only local models)
+                          val radarReport = analyzeBitmapForGames(bmp, screenW, screenH)
+                          sb.appendLine(radarReport)
 
-                      // 5. Dedup check: if identical to last attached frame, skip attaching duplicate image
-                      if (!forceAttachEvenIfUnchanged && frameHash == lastFrameHash && lastFrameHash.isNotEmpty()) {
-                          scaledClean.recycle()
+                          // 3. Draw ONLY the clean calibrated (x,y) coordinate grid (no red boxes covering cars!)
+                          drawCalibratedCoordinateGrid(scaled, screenW, screenH)
+
+                          val outFile = File(applicationContext.cacheDir, "human_eye_latest.jpg")
+                          FileOutputStream(outFile).use { fos ->
+                              scaled.compress(Bitmap.CompressFormat.JPEG, 68, fos)
+                              fos.flush()
+                          }
+                          scaled.recycle()
                           bmp.recycle()
-                          Log.i(TAG, "vision: skipped (frame unchanged)")
-                          return mapOf(
-                              "status" to "unchanged",
-                              "hash" to frameHash,
-                              "uiDump" to fullSummary,
-                              "activePackage" to activePkg
-                          )
+
+                          Log.i(TAG, "vision: attached (${outFile.length()} bytes)")
+                          sb.appendLine("[SCREEN_VISION_IMAGE:${outFile.absolutePath}]")
+                      } catch (e: Exception) {
+                          try {
+                              bmp.recycle()
+                          } catch (_: Exception) {}
+                          Log.i(TAG, "vision: capture failed: ${e.message}")
+                          sb.appendLine("Vision Frame Note: ${e.message}")
                       }
-
-                      lastFrameHash = frameHash
-
-                      // 6. Draw ARTEMIS Set-of-Mark badges [#1, #2] + calibrated coordinate grid onto the annotated copy
-                      val annotated = scaledClean.copy(Bitmap.Config.ARGB_8888, true)
-                      drawArtemisOverlay(annotated, screenW, screenH, uiTargets, radarTargets)
-
-                      val outFile = File(applicationContext.cacheDir, "human_eye_latest.jpg")
-                      FileOutputStream(outFile).use { fos ->
-                          annotated.compress(Bitmap.CompressFormat.JPEG, 65, fos)
-                          fos.flush()
-                      }
-
-                      annotated.recycle()
-                      scaledClean.recycle()
-                      bmp.recycle()
-
-                      Log.i(TAG, "vision: attached (hash=$frameHash, size=${outFile.length()} bytes)")
-                      return mapOf(
-                          "status" to "attached",
-                          "path" to outFile.absolutePath,
-                          "hash" to frameHash,
-                          "uiDump" to fullSummary,
-                          "activePackage" to activePkg
-                      )
-                  } catch (e: Exception) {
-                      try {
-                          bmp.recycle()
-                      } catch (_: Exception) {}
-                      Log.i(TAG, "vision: capture failed: ${e.message}")
-                      return mapOf(
-                          "status" to "failed",
-                          "reason" to (e.message ?: "unknown error"),
-                          "uiDump" to uiDumpSb.toString().trim(),
-                          "activePackage" to activePkg
-                      )
+                  } else {
+                      Log.i(TAG, "vision: capture failed: null bitmap")
+                      sb.appendLine("[vision: capture failed — working from UI tree dump below]")
                   }
+
+                  val uiHierarchy = dumpUiHierarchy(maxNodes = 35)
+                  sb.appendLine("=== UI TREE DUMP (Exact coordinates when present) ===")
+                  sb.appendLine(uiHierarchy)
+
+                  return sb.toString().trim()
               }
 
-              /**
-               * Explicit tool fallback when the agent calls see_screen directly.
-               */
-              fun captureScreenVision(): String {
-                  val map = captureLiveVisionFrame(forceAttachEvenIfUnchanged = true)
-                  val status = map["status"] as? String ?: "failed"
-                  val uiDump = map["uiDump"] as? String ?: ""
-                  val path = map["path"] as? String
-                  val reason = map["reason"] as? String
-                  val sb = StringBuilder()
-                  sb.appendLine("=== ARTEMIS & HUMAN EYE LIVE SCREEN STATE ===")
-                  sb.appendLine(uiDump)
-                  if (status == "attached" && !path.isNullOrEmpty()) {
-                      sb.appendLine("[SCREEN_VISION_IMAGE:$path]")
-                  } else if (reason != null) {
-                      sb.appendLine("[vision: capture failed: $reason]")
+              private fun takeScreenshotWithRetry(): Bitmap? {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+                  val now = System.currentTimeMillis()
+                  val elapsed = now - lastCaptureTimeMs
+                  if (elapsed in 1..950) {
+                      try {
+                          Thread.sleep(950L - elapsed)
+                      } catch (_: Exception) {}
                   }
-                  return sb.toString().trim()
+                  var bmp = takeScreenshotOnce()
+                  if (bmp == null) {
+                      try {
+                          Thread.sleep(1000L)
+                      } catch (_: Exception) {}
+                      bmp = takeScreenshotOnce()
+                  }
+                  return bmp
               }
 
               private fun takeScreenshotOnce(): Bitmap? {
@@ -336,7 +253,7 @@ jobs:
                                       val colorSpace = screenshot.colorSpace
                                       val hwBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
                                       if (hwBitmap != null) {
-                                          captured = hwBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                          captured = hwBitmap.copy(Bitmap.Config.ARGB_8888, true)
                                           hwBitmap.recycle()
                                       }
                                       hwBuffer.close()
@@ -366,88 +283,33 @@ jobs:
                   return sb.toString()
               }
 
-              private fun collectUiTargets(root: AccessibilityNodeInfo?, maxNodes: Int): List<IndexedTarget> {
-                  if (root == null) return emptyList()
-                  val list = mutableListOf<IndexedTarget>()
-                  var idx = 1
-
-                  fun traverse(node: AccessibilityNodeInfo?) {
-                      if (node == null || idx > maxNodes) return
-                      val text = node.text?.toString()?.trim().orEmpty()
-                      val desc = node.contentDescription?.toString()?.trim().orEmpty()
-                      val viewId = node.viewIdResourceName?.substringAfter("/") ?: ""
-                      val isClickable = node.isClickable
-                      val isEditable = node.isEditable
-                      val isScrollable = node.isScrollable
-
-                      if (text.isNotEmpty() || desc.isNotEmpty() || isClickable || isEditable) {
-                          val rect = Rect()
-                          node.getBoundsInScreen(rect)
-                          if (rect.width() > 8 && rect.height() > 8) {
-                              val cls = node.className?.toString()?.substringAfterLast('.') ?: "View"
-                              val flags = mutableListOf<String>()
-                              if (isClickable) flags.add("click")
-                              if (isEditable) flags.add("edit")
-                              if (isScrollable) flags.add("scroll")
-                              val labelParts = mutableListOf<String>(cls)
-                              if (text.isNotEmpty()) labelParts.add("text='$text'")
-                              if (desc.isNotEmpty()) labelParts.add("desc='$desc'")
-                              if (viewId.isNotEmpty()) labelParts.add("id='$viewId'")
-                              if (flags.isNotEmpty()) labelParts.add("(${flags.joinToString(",")})")
-
-                              list.add(
-                                  IndexedTarget(
-                                      index = idx++,
-                                      label = labelParts.joinToString(" "),
-                                      centerX = rect.centerX(),
-                                      centerY = rect.centerY(),
-                                      bounds = rect,
-                                      isUiNode = true
-                                  )
-                              )
-                          }
-                      }
-                      for (i in 0 until node.childCount) {
-                          traverse(node.getChild(i))
-                      }
-                  }
-
-                  traverse(root)
-                  return list
-              }
-
-              private fun drawArtemisOverlay(
-                  bmp: Bitmap,
-                  realW: Int,
-                  realH: Int,
-                  uiTargets: List<IndexedTarget>,
-                  radarTargets: List<IndexedTarget>
-              ) {
+              /**
+               * Draws a clean 6x10 coordinate grid with real-screen (x, y) labels onto the screenshot
+               * without obscuring game sprites or cars.
+               */
+              private fun drawCalibratedCoordinateGrid(bmp: Bitmap, realW: Int, realH: Int) {
                   val canvas = Canvas(bmp)
                   val w = bmp.width.toFloat()
                   val h = bmp.height.toFloat()
-                  val scaleX = w / realW.toFloat()
-                  val scaleY = h / realH.toFloat()
-
-                  // 1. Subtle 6x8 calibrated (x,y) coordinate grid
                   val cols = 6
-                  val rows = 8
+                  val rows = 10
+
                   val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(95, 0, 255, 255)
-                      strokeWidth = 1.1f
+                      color = Color.argb(105, 0, 255, 255)
+                      strokeWidth = 1.2f
                       style = Paint.Style.STROKE
                   }
                   val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(210, 255, 255, 0)
+                      color = Color.argb(230, 255, 255, 0)
                       style = Paint.Style.FILL
                   }
                   val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(160, 0, 0, 0)
+                      color = Color.argb(165, 0, 0, 0)
                       style = Paint.Style.FILL
                   }
                   val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                       color = Color.rgb(255, 255, 100)
-                      textSize = max(11f, min(w, h) * 0.022f)
+                      textSize = max(11f, min(w, h) * 0.023f)
                       isFakeBoldText = true
                   }
 
@@ -459,64 +321,41 @@ jobs:
                       val gy = (h * r) / rows
                       canvas.drawLine(0f, gy, w, gy, linePaint)
                   }
+
                   for (r in 1 until rows) {
                       for (c in 1 until cols) {
                           val gx = (w * c) / cols
                           val gy = (h * r) / rows
-                          val rx = (realW * c) / cols
-                          val ry = (realH * r) / rows
-                          val label = "$rx,$ry"
-                          canvas.drawCircle(gx, gy, 2.5f, dotPaint)
+                          val realX = (realW * c) / cols
+                          val realY = (realH * r) / rows
+                          val label = "$realX,$realY"
+
+                          canvas.drawCircle(gx, gy, 3f, dotPaint)
                           val tw = textPaint.measureText(label)
                           val th = textPaint.textSize
-                          canvas.drawRect(gx + 2f, gy - th, gx + tw + 6f, gy + 2f, bgPaint)
-                          canvas.drawText(label, gx + 4f, gy - 1f, textPaint)
+                          canvas.drawRect(gx + 3f, gy - th, gx + tw + 7f, gy + 3f, bgPaint)
+                          canvas.drawText(label, gx + 5f, gy - 1f, textPaint)
                       }
-                  }
-
-                  // 2. ARTEMIS Set-of-Mark badges [#1, #2...] over interactive targets
-                  val badgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(215, 220, 20, 60)
-                      style = Paint.Style.FILL
-                  }
-                  val badgeTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.WHITE
-                      textSize = max(12f, min(w, h) * 0.025f)
-                      isFakeBoldText = true
-                  }
-
-                  val allToMark = (uiTargets.take(20) + radarTargets.take(10))
-                  for (t in allToMark) {
-                      val bx = t.centerX * scaleX
-                      val by = t.centerY * scaleY
-                      val tag = "#${t.index}"
-                      val tw = badgeTextPaint.measureText(tag)
-                      val th = badgeTextPaint.textSize
-                      canvas.drawRect(bx - tw / 2 - 4f, by - th / 2 - 3f, bx + tw / 2 + 4f, by + th / 2 + 3f, badgeBgPaint)
-                      canvas.drawText(tag, bx - tw / 2, by + th / 3, badgeTextPaint)
                   }
               }
 
-              private fun analyzeBitmapForGames(
-                  bmp: Bitmap,
-                  screenW: Int,
-                  screenH: Int,
-                  startIndex: Int
-              ): List<IndexedTarget> {
+              private fun analyzeBitmapForGames(bmp: Bitmap, screenW: Int, screenH: Int): String {
                   val cols = 8
                   val rows = 12
                   val bw = bmp.width
                   val bh = bmp.height
 
-                  data class RawSpot(
-                      val realX: Int,
-                      val realY: Int,
-                      val score: Double,
-                      val label: String
+                  data class Hotspot(
+                      val screenX: Int,
+                      val screenY: Int,
+                      val contrastScore: Double,
+                      val colorLabel: String,
+                      val zoneLabel: String
                   )
 
-                  val spots = mutableListOf<RawSpot>()
-                  for (r in 2 until (rows - 1)) { // Skip r < 2 (Top HUD / Settings gear) & bottom system bar
+                  val hotspots = mutableListOf<Hotspot>()
+
+                  for (r in 2 until (rows - 2)) { // Skip Top-HUD (r < 2) and Bottom Powerup bar (r >= rows - 2)
                       for (c in 0 until cols) {
                           val x0 = (c * bw) / cols
                           val y0 = (r * bh) / rows
@@ -546,36 +385,36 @@ jobs:
                               val realX = ((cx.toFloat() / bw.toFloat()) * screenW).toInt()
                               val realY = ((cy.toFloat() / bh.toFloat()) * screenH).toInt()
                               val zone = when {
-                                  r >= rows - 2 -> "Bottom-Bar"
-                                  c < 3 -> "Arena-Left"
-                                  c >= cols - 3 -> "Arena-Right"
-                                  else -> "Arena-Center"
+                                  c < 3 -> "Play-Arena-Left"
+                                  c >= cols - 3 -> "Play-Arena-Right"
+                                  else -> "Play-Arena-Center"
                               }
-                              val colorName = classifyColor(centerPixel, hsv)
-                              spots.add(
-                                  RawSpot(
-                                      realX = realX,
-                                      realY = realY,
-                                      score = score,
-                                      label = "[$zone] $colorName target"
+                              hotspots.add(
+                                  Hotspot(
+                                      screenX = realX,
+                                      screenY = realY,
+                                      contrastScore = score,
+                                      colorLabel = classifyColor(centerPixel, hsv),
+                                      zoneLabel = zone
                                   )
                               )
                           }
                       }
                   }
 
-                  val top = spots.sortedByDescending { it.score }.take(10)
-                  var idx = startIndex
-                  return top.map { s ->
-                      IndexedTarget(
-                          index = idx++,
-                          label = s.label,
-                          centerX = s.realX,
-                          centerY = s.realY,
-                          bounds = Rect(s.realX - 30, s.realY - 30, s.realX + 30, s.realY + 30),
-                          isUiNode = false
-                      )
+                  val topSpots = hotspots.sortedByDescending { it.contrastScore }.take(10)
+                  val out = StringBuilder()
+                  out.appendLine("=== VISUAL RADAR (PLAY ARENA COLOR REGIONS) ===")
+                  if (topSpots.isEmpty()) {
+                      out.appendLine("• Play arena ready. Read exact (x,y) coordinates from the yellow grid on the image.")
+                  } else {
+                      for (spot in topSpots) {
+                          out.appendLine(
+                              "• [${spot.zoneLabel}] ${spot.colorLabel} region near (${spot.screenX}, ${spot.screenY})"
+                          )
+                      }
                   }
+                  return out.toString().trim()
               }
 
               private fun colorDiff(c1: Int, c2: Int): Int {
@@ -591,7 +430,7 @@ jobs:
                   if (v < 0.18f) return "Dark/Black"
                   if (s < 0.18f) return if (v > 0.82f) "Bright-White" else "Gray/Silver"
                   return when {
-                      h < 20f || h >= 340f -> "Red/Pink"
+                      h < 20f || h >= 340f -> "Red/Crimson"
                       h < 45f -> "Orange/Bronze"
                       h < 70f -> "Yellow/Gold"
                       h < 165f -> "Green/Emerald"
@@ -612,17 +451,6 @@ jobs:
                   return y.coerceIn(45f, max(100f, h - 75f))
               }
 
-              fun clickByIndex(index: Int): String {
-                  val target = indexedTargets[index]
-                      ?: return "Error: Target index #$index not found in current frame. Check UI dump or coordinates."
-                  val ok = tapCoordinates(safeX(target.centerX.toFloat()), safeY(target.centerY.toFloat()), 65L)
-                  return if (ok) {
-                      "Clicked [#${target.index}] ${target.label} at (${target.centerX}, ${target.centerY})."
-                  } else {
-                      "Failed to click [#${target.index}] at (${target.centerX}, ${target.centerY})."
-                  }
-              }
-
               fun performGameBatch(stepsJson: String): String {
                   return try {
                       val arr = JSONArray(stepsJson)
@@ -631,11 +459,8 @@ jobs:
                       for (i in 0 until count) {
                           val obj = arr.getJSONObject(i)
                           val type = obj.optString("action_type", "tap")
-                          val targetIdx = obj.optInt("target_index", -1)
-                          val indexed = if (targetIdx > 0) indexedTargets[targetIdx] else null
-
-                          val x = indexed?.centerX?.toFloat() ?: obj.optDouble("x", 540.0).toFloat()
-                          val y = indexed?.centerY?.toFloat() ?: obj.optDouble("y", 1200.0).toFloat()
+                          val x = obj.optDouble("x", 540.0).toFloat()
+                          val y = obj.optDouble("y", 950.0).toFloat()
                           val endX = obj.optDouble("end_x", x.toDouble()).toFloat()
                           val endY = obj.optDouble("end_y", y.toDouble()).toFloat()
                           val secondX = obj.optDouble("second_x", 850.0).toFloat()
@@ -649,7 +474,7 @@ jobs:
                               Thread.sleep(waitAfterMs)
                           }
                       }
-                      "Executed ${results.size} ARTEMIS Action Burst steps:\n" + results.joinToString("\n")
+                      "Executed ${results.size} batch game steps:\n" + results.joinToString("\n")
                   } catch (e: Exception) {
                       "Batch execution error: ${e.message}"
                   }
@@ -704,36 +529,51 @@ jobs:
                   }
               }
 
-              fun dumpUiHierarchy(maxNodes: Int = 80): String {
+              fun dumpUiHierarchy(maxNodes: Int = 60): String {
                   val root = rootInActiveWindow
                       ?: return "No standard XML UI tree (Fullscreen Game / Canvas active)."
-                  val targets = collectUiTargets(root, maxNodes)
-                  for (t in targets) {
-                      indexedTargets[t.index] = t
-                  }
-                  if (targets.isEmpty()) {
-                      return "Canvas/Game surface active (${root.packageName}) — use live vision frame coordinates."
-                  }
                   val sb = StringBuilder()
-                  sb.appendLine("Active Package: ${root.packageName ?: "unknown"}")
-                  for (t in targets) {
-                      sb.appendLine("[#${t.index}] ${t.label} | center=(${t.centerX},${t.centerY})")
+                  var count = 0
+
+                  fun traverse(node: AccessibilityNodeInfo?) {
+                      if (node == null || count >= maxNodes) return
+                      val text = node.text?.toString()?.trim().orEmpty()
+                      val desc = node.contentDescription?.toString()?.trim().orEmpty()
+                      val viewId = node.viewIdResourceName?.substringAfter("/") ?: ""
+                      val isClickable = node.isClickable
+                      val isEditable = node.isEditable
+                      val isScrollable = node.isScrollable
+
+                      if (text.isNotEmpty() || desc.isNotEmpty() || isClickable || isEditable) {
+                          val rect = Rect()
+                          node.getBoundsInScreen(rect)
+                          if (rect.width() > 8 && rect.height() > 8) {
+                              count++
+                              val cx = rect.centerX()
+                              val cy = rect.centerY()
+                              val cls = node.className?.toString()?.substringAfterLast('.') ?: "View"
+                              sb.appendLine(
+                                  "[$count] $cls | text='$text' | desc='$desc' | id='$viewId' | center=($cx,$cy)"
+                              )
+                          }
+                      }
+
+                      for (i in 0 until node.childCount) {
+                          traverse(node.getChild(i))
+                      }
                   }
-                  return sb.toString().trim()
+
+                  traverse(root)
+                  return if (count == 0) {
+                      "Canvas/Game surface active (${root.packageName}) — use the yellow (x,y) coordinate grid on the attached screenshot."
+                  } else {
+                      sb.toString().trim()
+                  }
               }
 
               fun clickByText(query: String): Boolean {
                   val root = rootInActiveWindow ?: return false
-                  val trimmed = query.trim()
-                  if (trimmed.startsWith("#") && trimmed.substring(1).toIntOrNull() != null) {
-                      val idx = trimmed.substring(1).toInt()
-                      val target = indexedTargets[idx]
-                      if (target != null) {
-                          return tapCoordinates(safeX(target.centerX.toFloat()), safeY(target.centerY.toFloat()))
-                      }
-                  }
-
-                  val normalized = trimmed.lowercase()
+                  val normalized = query.trim().lowercase()
                   val match = findNodeMatching(root) { node ->
                       val t = node.text?.toString()?.lowercase().orEmpty()
                       val d = node.contentDescription?.toString()?.lowercase().orEmpty()
@@ -1089,17 +929,6 @@ jobs:
                                           svc?.captureScreenVision()
                                               ?: "Error: Accessibility Service is not enabled. Enable PocketStrike in Settings > Accessibility."
                                       }
-                                      "clickIndex" -> {
-                                          val index = (call.argument<Number>("index")?.toInt()) ?: -1
-                                          val svc = PocketStrikeAccessibilityService.instance
-                                          if (svc == null) {
-                                              "Error: Accessibility Service is not enabled."
-                                          } else {
-                                              val msg = svc.clickByIndex(index)
-                                              Thread.sleep(350)
-                                              msg
-                                          }
-                                      }
                                       "gameAction" -> {
                                           val stepsJson = call.argument<String>("stepsJson")
                                           val targetIndex = (call.argument<Number>("targetIndex")?.toInt()) ?: -1
@@ -1111,7 +940,7 @@ jobs:
                                           val secondX = (call.argument<Number>("secondX")?.toFloat()) ?: 850f
                                           val secondY = (call.argument<Number>("secondY")?.toFloat()) ?: 1600f
                                           val durationMs = (call.argument<Number>("durationMs")?.toLong()) ?: 65L
-                                          val captureAfter = call.argument<Boolean>("captureAfter") ?: false
+                                          val captureAfter = call.argument<Boolean>("captureAfter") ?: true
 
                                           val svc = PocketStrikeAccessibilityService.instance
                                           if (svc == null) {
@@ -1119,7 +948,6 @@ jobs:
                                           } else {
                                               val status = when {
                                                   !stepsJson.isNullOrBlank() -> svc.performGameBatch(stepsJson)
-                                                  targetIndex > 0 -> svc.clickByIndex(targetIndex)
                                                   else -> {
                                                       val ok = svc.performGameAction(
                                                           actionType = actionType,
@@ -1496,7 +1324,7 @@ jobs:
             static AgentTool seeScreen() => AgentTool(
                   name: 'see_screen',
                   description:
-                      'Captures a fresh screenshot of the current phone screen on demand with ARTEMIS Set-of-Mark [#index] badges, calibrated (x,y) coordinate grid, UI dump, and Visual Radar. Note: When Live Screen Vision is ON, a fresh frame is already attached automatically each turn — only call this if you need an explicit manual refresh.',
+                      'Human Eye Vision (العين البشرية): Captures the live phone screen in real time with a calibrated yellow (x, y) coordinate grid drawn directly on the image so you can read exact pixel coordinates of cars, tiles, and buttons.',
                   inputSchema: const {
                     'type': 'object',
                     'properties': <String, dynamic>{},
@@ -1515,19 +1343,18 @@ jobs:
             static AgentTool gameAction() => AgentTool(
                   name: 'game_action',
                   description:
-                      'ARTEMIS Action Burst & Game Controller: Executes single or batched moves ("steps") by element index ("target_index": 1) or screen coordinates (x, y). Whenever multiple moves are visible (e.g. matching 3 or 9 cars/tiles), pass ALL moves together in the "steps" array so they execute in ONE fast burst!',
+                      'Executes real-time Android game moves at exact screen pixel coordinates (x, y) read from the yellow coordinate grid, and automatically captures the updated screen frame. IMPORTANT: Whenever multiple moves/taps are visible (e.g. matching 3 or 9 cars/tiles), ALWAYS pass all moves together in the "steps" array so they execute in ONE fast batch!',
                   inputSchema: const {
                     'type': 'object',
                     'properties': {
                       'steps': {
                         'type': 'array',
                         'description':
-                            'PREFERRED FOR FAST ACTION BURSTS: List of sequential moves in one turn (e.g. [{"action_type":"tap","x":360,"y":900,"wait_ms":350}, {"action_type":"tap","target_index":2,"wait_ms":350}]).',
+                            'PREFERRED FOR FAST GAMEPLAY: List of sequential moves to execute in one batch using exact (x, y) pixel coordinates from the yellow grid (e.g. [{"action_type":"tap","x":360,"y":950,"wait_ms":380}, {"action_type":"tap","x":540,"y":950,"wait_ms":380}, {"action_type":"tap","x":720,"y":950,"wait_ms":380}]).',
                         'items': {
                           'type': 'object',
                           'properties': {
                             'action_type': {'type': 'string'},
-                            'target_index': {'type': 'number'},
                             'x': {'type': 'number'},
                             'y': {'type': 'number'},
                             'end_x': {'type': 'number'},
@@ -1535,12 +1362,8 @@ jobs:
                             'duration_ms': {'type': 'number'},
                             'wait_ms': {'type': 'number'},
                           },
+                          'required': ['x', 'y'],
                         },
-                      },
-                      'target_index': {
-                        'type': 'number',
-                        'description':
-                            'Optional ARTEMIS Set-of-Mark badge number (e.g. 1 for [#1]) to click directly.',
                       },
                       'action_type': {
                         'type': 'string',
@@ -1549,11 +1372,11 @@ jobs:
                       },
                       'x': {
                         'type': 'number',
-                        'description': 'Primary X coordinate in pixels.',
+                        'description': 'Primary X coordinate in pixels (read from the yellow coordinate grid).',
                       },
                       'y': {
                         'type': 'number',
-                        'description': 'Primary Y coordinate in pixels.',
+                        'description': 'Primary Y coordinate in pixels (read from the yellow coordinate grid).',
                       },
                       'end_x': {
                         'type': 'number',
@@ -1575,6 +1398,11 @@ jobs:
                         'type': 'number',
                         'description': 'Gesture duration in milliseconds (default 65).',
                       },
+                      'capture_after': {
+                        'type': 'boolean',
+                        'description':
+                            'Whether to capture the updated screen frame after executing the batch (default: true).',
+                      },
                     },
                   },
                   risk: ToolRisk.safe,
@@ -1584,19 +1412,18 @@ jobs:
                     if (rawSteps is List && rawSteps.isNotEmpty) {
                       stepsJson = jsonEncode(rawSteps);
                     }
-                    final targetIndex = (args['target_index'] as num?)?.toInt() ?? -1;
                     final actionType = args['action_type'] as String? ?? 'tap';
                     final x = (args['x'] as num?)?.toDouble() ?? 540.0;
-                    final y = (args['y'] as num?)?.toDouble() ?? 1200.0;
+                    final y = (args['y'] as num?)?.toDouble() ?? 950.0;
                     final endX = (args['end_x'] as num?)?.toDouble() ?? x;
                     final endY = (args['end_y'] as num?)?.toDouble() ?? y;
                     final secondX = (args['second_x'] as num?)?.toDouble() ?? 850.0;
                     final secondY = (args['second_y'] as num?)?.toDouble() ?? 1600.0;
                     final durationMs = (args['duration_ms'] as num?)?.toInt() ?? 65;
+                    final captureAfter = args['capture_after'] as bool? ?? true;
                     try {
                       final res = await _channel.invokeMethod<String>('gameAction', {
                         'stepsJson': stepsJson,
-                        'targetIndex': targetIndex,
                         'actionType': actionType,
                         'x': x,
                         'y': y,
@@ -1605,7 +1432,7 @@ jobs:
                         'secondX': secondX,
                         'secondY': secondY,
                         'durationMs': durationMs,
-                        'captureAfter': false,
+                        'captureAfter': captureAfter,
                       });
                       return res ?? 'Executed game action';
                     } catch (e) {
@@ -1643,7 +1470,7 @@ jobs:
                       'app': {
                         'type': 'string',
                         'description':
-                            'App or game name (e.g. "YouTube", "يوتيوب") or package name.',
+                            'App or game name (e.g. "YouTube", "يوتيوب", "Car Match") or package name.',
                       },
                       'search_query': {
                         'type': 'string',
@@ -1672,7 +1499,7 @@ jobs:
             static AgentTool getScreenElements() => AgentTool(
                   name: 'get_screen_elements',
                   description:
-                      'Reads the current phone screen via AccessibilityService and returns all visible UI elements with their [#index] and exact center (x, y) coordinates.',
+                      'Reads the current phone screen via AccessibilityService and returns all visible UI buttons, text fields, labels, and their center (x, y) coordinates.',
                   inputSchema: const {
                     'type': 'object',
                     'properties': <String, dynamic>{},
@@ -1691,14 +1518,14 @@ jobs:
             static AgentTool clickElement() => AgentTool(
                   name: 'click_element',
                   description:
-                      'Clicks a UI element on the phone screen by its ARTEMIS index (e.g. "#1" or "1") or by its visible text, content description, or view ID (e.g. "Search", "بحث").',
+                      'Clicks a UI element or button on the phone screen matching its visible text, content description, or view ID (e.g. "Search", "بحث", "Play").',
                   inputSchema: const {
                     'type': 'object',
                     'properties': {
                       'target': {
                         'type': 'string',
                         'description':
-                            'Element index (e.g. "#1") or visible text/description/ID of the element to click.',
+                            'Visible text, description, or resource ID of the element to click.',
                       },
                     },
                     'required': ['target'],
@@ -1982,8 +1809,6 @@ jobs:
           import 'dart:convert';
 
           import 'package:dio/dio.dart' show CancelToken;
-          import 'package:flutter/foundation.dart';
-          import 'package:flutter/services.dart';
           import 'package:uuid/uuid.dart';
 
           import '../../../core/models/chat_models.dart';
@@ -1992,14 +1817,11 @@ jobs:
           import '../domain/agent_event.dart';
           import '../domain/agent_tool.dart';
 
-          /// ReAct-style agent loop enhanced with Google ARTEMIS 5-part architecture
-          /// and automatic Live Screen Vision injection.
+          /// ReAct-style agent loop enhanced with ARTEMIS Single-Image History Compression.
           class AgentEngine {
             AgentEngine({this.maxSteps = 50});
 
             static const _uuid = Uuid();
-            static const MethodChannel _visionChannel =
-                MethodChannel('com.pocketstrike/automation');
 
             final int maxSteps;
 
@@ -2017,12 +1839,10 @@ jobs:
                 var content = m.content;
 
                 if (!isLast) {
-                  // Strip any stored screenshot markers from older messages (Rule 4: ONE image per request, always)
                   content = content.replaceAll(
                     RegExp(r'\[SCREEN_VISION_IMAGE:[^\]]+\]'),
                     '[earlier screenshot folded by ARTEMIS history compression]',
                   );
-                  // Compress verbose UI dumps in older tool turns (> 2 steps old)
                   if (m.role == MessageRole.tool && i < rawMessages.length - 3 && content.length > 600) {
                     final lines = content.split('\n');
                     final head = lines.take(6).join('\n');
@@ -2030,7 +1850,6 @@ jobs:
                   }
                 } else if (liveVisionBlockForLastMessage != null &&
                     liveVisionBlockForLastMessage.isNotEmpty) {
-                  // Replace any stored screenshot on the last message with the fresh frame
                   content = content.replaceAll(RegExp(r'\[SCREEN_VISION_IMAGE:[^\]]+\]'), '').trim();
                   content = '$content\n\n$liveVisionBlockForLastMessage'.trim();
                 }
@@ -2038,49 +1857,6 @@ jobs:
                 out.add(m.copyWith(content: content));
               }
               return out;
-            }
-
-            Future<String?> _captureLiveVisionForTurn(int step) async {
-              try {
-                if (step == 0) {
-                  await _visionChannel.invokeMethod('resetVisionSession');
-                }
-                final raw = await _visionChannel.invokeMethod<Map<Object?, Object?>>(
-                  'captureLiveVisionFrame',
-                  {'forceAttach': step == 0},
-                );
-                if (raw == null) {
-                  debugPrint('vision: capture failed: null channel response');
-                  return '[vision unavailable: capture failed (null response) — screenshot was NOT delivered to you this turn.]';
-                }
-                final status = raw['status'] as String? ?? 'failed';
-                final uiDump = raw['uiDump'] as String? ?? '';
-                final path = raw['path'] as String?;
-                final reason = raw['reason'] as String? ?? 'unknown';
-
-                switch (status) {
-                  case 'attached':
-                    debugPrint('vision: attached');
-                    return '[live vision: fresh screenshot attached | '
-                        'ARTEMIS Set-of-Mark [#index] & (x,y) Grid active]\n'
-                        '$uiDump\n'
-                        '[SCREEN_VISION_IMAGE:$path]';
-                  case 'unchanged':
-                    debugPrint('vision: skipped (frame unchanged)');
-                    final incidentWarn = step > 0
-                        ? '⚠️ ARTEMIS SAFETY NET INCIDENT: Screen did NOT change after your last action! '
-                            'Do NOT repeat the exact same tap/coordinates — adjust position or check the UI dump.'
-                        : 'Screen unchanged since last frame.';
-                    return '[live vision: skipped (frame unchanged) | $incidentWarn]\n$uiDump';
-                  default:
-                    debugPrint('vision: capture failed: $reason');
-                    return '[vision unavailable: capture failed ($reason) — screenshot was NOT delivered to you this turn. '
-                        'Work from the UI dump below:]\n$uiDump';
-                }
-              } catch (e) {
-                debugPrint('vision: capture failed: $e');
-                return null;
-              }
             }
 
             Stream<AgentEvent> run({
@@ -2113,15 +1889,7 @@ jobs:
                   step == 0 ? 'Thinking…' : 'Thinking (step ${step + 1})…',
                 );
 
-                // Build outgoing request messages with optional automatic Live Screen Vision
-                String? liveVisionBlock;
-                if (liveVisionEnabled) {
-                  liveVisionBlock = await _captureLiveVisionForTurn(step);
-                }
-                final requestMessages = prepareMessagesWithSingleVisionAndCompression(
-                  messages,
-                  liveVisionBlockForLastMessage: liveVisionBlock,
-                );
+                final requestMessages = prepareMessagesWithSingleVisionAndCompression(messages);
 
                 final textBuffer = StringBuffer();
                 final toolCalls = <ToolCallInfo>[];
@@ -2171,7 +1939,6 @@ jobs:
                 );
                 messages.add(assistantMessage);
 
-                // No tool calls -> final answer verified by Checker gate.
                 if (toolCalls.isEmpty) {
                   yield AgentAssistantMessageEvent(assistantMessage);
                   break;
@@ -5253,9 +5020,6 @@ jobs:
               var tokenCount = 0;
               double? lastTps;
 
-              final liveVisionOn =
-                  ref.read(sharedPreferencesProvider).getBool('tool_live_vision') ?? true;
-
               await for (final event in engine.run(
                 provider: provider,
                 history: history,
@@ -5266,7 +5030,6 @@ jobs:
                 sessionApproved: _sessionApprovedTools,
                 forceConfirm: forceConfirm,
                 cancelToken: _cancelToken,
-                liveVisionEnabled: liveVisionOn,
                 requestConfirmation: (tool, call) async {
                   final handler = confirmHandler;
                   if (handler == null) return ConfirmResult.deny;
@@ -5295,7 +5058,16 @@ jobs:
                     );
                     break;
                   case AgentToolCallStartedEvent(:final call):
-                    if (buffer.isNotEmpty && !buffer.toString().endsWith('\n\n')) buffer.write('\n\n');
+                    final nonEmptyLines = buffer
+                        .toString()
+                        .split('\n')
+                        .map((l) => l.trim())
+                        .where((l) => l.isNotEmpty)
+                        .toList();
+                    buffer.clear();
+                    if (nonEmptyLines.isNotEmpty) {
+                      buffer.write('${nonEmptyLines.last}\n\n');
+                    }
                     steps.add(AgentStep(
                       type: 'toolCall',
                       timestamp: DateTime.now(),
@@ -5560,28 +5332,16 @@ jobs:
 
               if (state.agentMode || state.localMode) {
                 const agentImageInstruction =
-                    'You have full capabilities to generate images using the "generate_image" tool. When the user asks you to generate, create, draw, paint, design, or render an image, artwork, illustration, photo, or wallpaper, ALWAYS call the "generate_image" tool with a detailed, creative visual prompt and "1:1" aspect ratio unless specified otherwise.';
+                    'You have full capabilities to generate images using the "generate_image" tool. When the user asks you to generate, create, draw, paint, design, or render an image, artwork, illustration, photo, or wallpaper, ALWAYS call the "generate_image" tool with a detailed, creative visual prompt and "1:1" aspect ratio unless specified otherwise.\n\n'
+                    'HUMAN EYE LIVE SCREEN VISION & FAST BATCH GAME ENGINE:\n'
+                    '1. Call "see_screen" after opening a game/app to capture the live screen with a calibrated yellow (x,y) coordinate grid drawn directly on the image.\n'
+                    '2. Read the exact (x,y) pixel coordinates of targets inside the central play arena directly from the yellow coordinate labels on the image. NEVER tap the top HUD corners (such as the Settings gear icon at top-right, y < 380) unless explicitly asked.\n'
+                    '3. CRITICAL FOR SPEED (BATCH STEPS): Never tap one item at a time! When multiple moves are visible (e.g. matching 3 or 9 cars/tiles), pass ALL moves together in ONE "game_action" call using the "steps" array with exact (x,y) coordinates (e.g. "steps": [{"action_type":"tap","x":360,"y":950,"wait_ms":380}, {"action_type":"tap","x":540,"y":950,"wait_ms":380}, {"action_type":"tap","x":720,"y":950,"wait_ms":380}]).\n'
+                    '4. CONCISE 1-LINE STATUS: Write ONLY ONE short sentence (1 line) before calling a tool.\n'
+                    '5. STRICT STOP CONDITION: Respect the exact scope of the user request! If the user asks to complete a specific level (e.g. "المستوى الأول فقط" / Level 1 only), as soon as the screen shows Level 1 is cleared or "Level 2" appears, STOP calling any tools immediately and send your final completion message!';
                 systemPrompt = systemPrompt.isEmpty
                     ? agentImageInstruction
                     : '$systemPrompt\n\n$agentImageInstruction';
-
-                final liveVisionOn =
-                    ref.read(sharedPreferencesProvider).getBool('tool_live_vision') ?? true;
-                if (liveVisionOn) {
-                  const liveVisionAndArtemisContract = '''
-          ## Live Screen Vision & ARTEMIS 5-Part Execution Engine
-          [live vision: when an image is attached, it is a fresh automatic capture of the current screen — newer than any earlier screenshot. Trust exact coordinates from UI tree dumps over visual estimates; after acting, verify results on the next attached frame; if no image is attached this turn, you are text-only — never claim to see the screen.]
-
-          When Live Screen Vision is enabled, a fresh screenshot of the current screen is attached to your request automatically whenever the screen has changed. It appears with the marker "[live vision: ...]" and is your direct view of the device — always newer than any earlier screenshot in the conversation.
-
-          How to work with it (ARTEMIS 5-Part Protocol):
-          1. TRUST ORDER FOR TARGETING (Dynamic-First, Coordinate-Fallback): Exact coordinates and [#index] badges from the UI dump are always more precise than visual estimates. When the target exists in the dump, use its [#index] or exact coordinates. Use the live frame's calibrated yellow (x,y) coordinate grid and [#index] badges for targets the XML dump cannot see (games, canvases, maps, video) — state your action in ONE short line before acting, and NEVER tap top HUD Settings/Pause gear icons unless asked.
-          2. ACTION BURSTS (Batch Steps): When multiple moves are visible on screen (e.g. matching 3 or 9 cars/tiles in a game), pass ALL moves together in ONE "game_action" call using the "steps" array (e.g. "steps": [{"action_type":"tap","x":360,"y":920,"wait_ms":380}, ...]) to execute in a single burst.
-          3. ACT, THEN VERIFY & SAFETY NET: After each action, the next live frame tells you the result. If you see "⚠️ ARTEMIS SAFETY NET INCIDENT: Screen did NOT change", never repeat the same coordinates — adjust immediately.
-          4. BE HONEST ABOUT WHAT YOU SEE: If this message has no image attached, you are text-only this turn — never describe or claim to see the screen. If you find "[vision unavailable ... NOT delivered]", say briefly that you cannot see the screen this turn and work from the UI dump.
-          5. EFFICIENCY & STRICT CHECKER STOP GATE: When a live frame is already attached, do NOT call "see_screen" just to look — act directly. As soon as the live frame shows the user's requested goal or level is completed (e.g. user asked for Level 1 only and Level 1 is cleared or Level 2 appears), STOP calling tools immediately and report completion!''';
-                  systemPrompt = '$systemPrompt\n\n$liveVisionAndArtemisContract';
-                }
               }
 
               if (systemPrompt.isNotEmpty) {
