@@ -106,8 +106,14 @@ jobs:
                       private set
               }
 
-              @Volatile
+                  @Volatile
               private var lastFrameHash: String = ""
+
+              @Volatile
+              private var lastRealWidth: Int = 1080
+
+              @Volatile
+              private var lastRealHeight: Int = 2400
 
               @Volatile
               private var lastCaptureTimeMs: Long = 0L
@@ -137,9 +143,13 @@ jobs:
                * so Vision models read exact car/button coordinates directly from the image on the 1st try.
                */
               fun captureScreenVision(): String {
+                  var capturedBitmap = takeScreenshotWithRetry()
                   val dm = resources.displayMetrics
-                  val screenW = dm.widthPixels
-                  val screenH = dm.heightPixels
+                  // Use exact hardware screenshot dimensions (1080x2400 on Samsung Galaxy M52 5G) so grid coordinates match dispatchGesture 1:1
+                  val screenW = capturedBitmap?.width ?: dm.widthPixels
+                  val screenH = capturedBitmap?.height ?: dm.heightPixels
+                  lastRealWidth = screenW
+                  lastRealHeight = screenH
                   val orientation = if (screenW > screenH) "Landscape (Game Mode)" else "Portrait"
 
                   val sb = StringBuilder()
@@ -154,8 +164,6 @@ jobs:
                       "SAFETY & STOP CHECK: (1) NEVER tap Top-Right/Top-Left HUD corners (y < ${(screenH * 0.16).toInt()}) where Settings/Pause gear icons live. " +
                           "(2) Check the current Level/screen state against the user's request: if the requested level or goal is already completed (e.g. user asked for Level 1 only and screen shows Victory or Level 2), STOP calling tools immediately and report completion!"
                   )
-
-                  var capturedBitmap = takeScreenshotWithRetry()
 
                   val bmp = capturedBitmap
                   if (bmp != null) {
@@ -442,13 +450,14 @@ jobs:
               }
 
               private fun safeX(x: Float): Float {
-                  val w = resources.displayMetrics.widthPixels.toFloat()
-                  return x.coerceIn(12f, max(20f, w - 12f))
+                  val w = max(lastRealWidth, resources.displayMetrics.widthPixels).toFloat()
+                  return x.coerceIn(15f, max(30f, w - 15f))
               }
 
               private fun safeY(y: Float): Float {
-                  val h = resources.displayMetrics.heightPixels.toFloat()
-                  return y.coerceIn(45f, max(100f, h - 75f))
+                  val h = max(lastRealHeight, resources.displayMetrics.heightPixels).toFloat()
+                  // Protects Samsung M52 5G top punch-hole status bar (90px) and bottom 3-button navigation bar (140px)
+                  return y.coerceIn(90f, max(150f, h - 140f))
               }
 
               fun performGameBatch(stepsJson: String): String {
@@ -902,19 +911,6 @@ jobs:
                                       "resetVisionSession" -> {
                                           PocketStrikeAccessibilityService.instance?.resetVisionSession()
                                           true
-                                      }
-                                      "captureLiveVisionFrame" -> {
-                                          val forceAttach = call.argument<Boolean>("forceAttach") ?: false
-                                          val svc = PocketStrikeAccessibilityService.instance
-                                          if (svc == null) {
-                                              mapOf(
-                                                  "status" to "failed",
-                                                  "reason" to "Accessibility Service is not enabled",
-                                                  "uiDump" to "Accessibility Service disabled"
-                                              )
-                                          } else {
-                                              svc.captureLiveVisionFrame(forceAttachEvenIfUnchanged = forceAttach)
-                                          }
                                       }
                                       "listInstalledApps" -> {
                                           listLaunchableApps()
