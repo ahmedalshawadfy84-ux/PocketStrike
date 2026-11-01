@@ -169,7 +169,7 @@ jobs:
                   if (bmp != null) {
                       try {
                           // 1. Downscale so longest side <= 1024px, JPEG quality 68
-                          val maxDim = 1024
+                          val maxDim = 1280
                           val scale = min(1.0f, maxDim.toFloat() / max(bmp.width, bmp.height).toFloat())
                           val targetW = max(1, (bmp.width * scale).toInt())
                           val targetH = max(1, (bmp.height * scale).toInt())
@@ -185,8 +185,9 @@ jobs:
 
                           if (wasUnchanged) {
                               sb.appendLine(
-                                  "⚠️ SAFETY NET NOTICE: The screen pixels did NOT change after the previous action (or tutorial overlay is waiting). " +
-                                      "Check the exact (x,y) position of the car/button on the yellow grid and tap its center!"
+                                  "⚠️ COGNITIVE FEEDBACK (NO SCREEN CHANGE DETECTED): The screen state did NOT change after your previous action! " +
+                                      "This means the target you interacted with is currently blocked by an obstacle/rule, non-interactive, disabled, or requires a prerequisite step first. " +
+                                      "Do NOT repeat the exact same action or coordinates — analyze the visual rules, obstacles, and active indicators on screen, then choose a valid alternative!"
                               )
                           }
 
@@ -199,7 +200,7 @@ jobs:
 
                           val outFile = File(applicationContext.cacheDir, "human_eye_latest.jpg")
                           FileOutputStream(outFile).use { fos ->
-                              scaled.compress(Bitmap.CompressFormat.JPEG, 68, fos)
+                              scaled.compress(Bitmap.CompressFormat.JPEG, 78, fos)
                               fos.flush()
                           }
                           scaled.recycle()
@@ -299,25 +300,25 @@ jobs:
                   val canvas = Canvas(bmp)
                   val w = bmp.width.toFloat()
                   val h = bmp.height.toFloat()
-                  val cols = 6
-                  val rows = 10
+                  val cols = 7
+                  val rows = 12
 
                   val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(105, 0, 255, 255)
-                      strokeWidth = 1.2f
+                      color = Color.argb(85, 0, 255, 255)
+                      strokeWidth = 1.0f
                       style = Paint.Style.STROKE
                   }
                   val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(230, 255, 255, 0)
+                      color = Color.argb(220, 255, 255, 0)
                       style = Paint.Style.FILL
                   }
                   val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(165, 0, 0, 0)
+                      color = Color.argb(145, 0, 0, 0)
                       style = Paint.Style.FILL
                   }
                   val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                       color = Color.rgb(255, 255, 100)
-                      textSize = max(11f, min(w, h) * 0.023f)
+                      textSize = max(10f, min(w, h) * 0.019f)
                       isFakeBoldText = true
                   }
 
@@ -475,7 +476,7 @@ jobs:
                           val secondX = obj.optDouble("second_x", 850.0).toFloat()
                           val secondY = obj.optDouble("second_y", 1600.0).toFloat()
                           val durationMs = obj.optLong("duration_ms", 65L)
-                          val waitAfterMs = obj.optLong("wait_ms", 380L).coerceIn(80L, 3000L)
+                          val waitAfterMs = obj.optLong("wait_ms", 550L).coerceIn(150L, 3500L)
 
                           val ok = performGameAction(type, x, y, endX, endY, secondX, secondY, durationMs)
                           results.add("Step ${i + 1}: $type(${x.toInt()},${y.toInt()}) -> ${if (ok) "OK" else "FAIL"}")
@@ -962,8 +963,8 @@ jobs:
                                                       }
                                                   }
                                               }
-                                              Thread.sleep(380)
                                               if (captureAfter) {
+                                                  Thread.sleep(1050)
                                                   "$status\n\n" + svc.captureScreenVision()
                                               } else {
                                                   status
@@ -3806,8 +3807,9 @@ jobs:
 
               if (request.tools.isNotEmpty) {
                 const toolGuide =
-                    '\n\n[ARTEMIS LOCAL AGENT TOOLS]\n'
-                    'To act on the phone, output a tool call block:\n'
+                    '\n\n[UNIVERSAL COGNITIVE PLANNING BRAIN & LOCAL AGENT TOOLS]\n'
+                    'Always think like a conscious human before acting: (1) Analyze the screen state, rules, and obstacles, (2) Predict the consequence of your move, (3) Never tap blocked/disabled elements or repeat a failed coordinate.\n'
+                    'To act on the phone, output your brief reasoning followed by a tool call block:\n'
                     '<tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>\n'
                     'Tools:\n'
                     '- game_action: {"steps": [{"action_type":"tap","target_index":1,"wait_ms":350}]} or {"action_type":"tap","x":540,"y":1200}\n'
@@ -5062,7 +5064,10 @@ jobs:
                         .toList();
                     buffer.clear();
                     if (nonEmptyLines.isNotEmpty) {
-                      buffer.write('${nonEmptyLines.last}\n\n');
+                      final keep = nonEmptyLines.length > 3
+                          ? nonEmptyLines.sublist(nonEmptyLines.length - 3)
+                          : nonEmptyLines;
+                      buffer.write('${keep.join("\n")}\n\n');
                     }
                     steps.add(AgentStep(
                       type: 'toolCall',
@@ -5329,12 +5334,16 @@ jobs:
               if (state.agentMode || state.localMode) {
                 const agentImageInstruction =
                     'You have full capabilities to generate images using the "generate_image" tool. When the user asks you to generate, create, draw, paint, design, or render an image, artwork, illustration, photo, or wallpaper, ALWAYS call the "generate_image" tool with a detailed, creative visual prompt and "1:1" aspect ratio unless specified otherwise.\n\n'
-                    'HUMAN EYE LIVE SCREEN VISION & FAST BATCH GAME ENGINE:\n'
-                    '1. Call "see_screen" after opening a game/app to capture the live screen with a calibrated yellow (x,y) coordinate grid drawn directly on the image.\n'
-                    '2. Read the exact (x,y) pixel coordinates of targets inside the central play arena directly from the yellow coordinate labels on the image. NEVER tap the top HUD corners (such as the Settings gear icon at top-right, y < 380) unless explicitly asked.\n'
-                    '3. CRITICAL FOR SPEED (BATCH STEPS): Never tap one item at a time! When multiple moves are visible (e.g. matching 3 or 9 cars/tiles), pass ALL moves together in ONE "game_action" call using the "steps" array with exact (x,y) coordinates (e.g. "steps": [{"action_type":"tap","x":360,"y":950,"wait_ms":380}, {"action_type":"tap","x":540,"y":950,"wait_ms":380}, {"action_type":"tap","x":720,"y":950,"wait_ms":380}]).\n'
-                    '4. CONCISE 1-LINE STATUS: Write ONLY ONE short sentence (1 line) before calling a tool.\n'
-                    '5. STRICT STOP CONDITION: Respect the exact scope of the user request! If the user asks to complete a specific level (e.g. "المستوى الأول فقط" / Level 1 only), as soon as the screen shows Level 1 is cleared or "Level 2" appears, STOP calling any tools immediately and send your final completion message!';
+                    'UNIVERSAL HUMAN-LIKE COGNITIVE & STRATEGIC REASONING ENGINE (FOR ALL APPS & ALL GAMES):\n'
+                    'You are a conscious, strategic agent with Human Eye Vision. Never act or tap randomly in any app or game! Before EVERY tool call, you MUST think like a human using this 3-line cognitive cycle:\n'
+                    '1. [الوعي بالمشهد والقوانين / Situational & Rule Awareness]: Observe the current screen carefully. Identify the app/game state, active goal, resource limits (e.g. remaining slots, capacity, health, timer, or UI state), and distinguish ACTIVE/UNBLOCKED elements (elements with free paths, active visual cues/eyes/highlights, or enabled buttons) from BLOCKED/LOCKED/DISABLED elements (obstructed by walls, other pieces, popups, or game rules).\n'
+                    '2. [التفكير الاستباقي قبل القرار / Pre-Action Consequence Thinking]: Ask yourself: "What will happen when I execute this action? Does it solve a constraint, unlock a blocked path, or advance the task safely without causing a loss/error?" State your deliberate plan in 2–3 concise lines before calling any tool.\n'
+                    '3. [التنفيذ الدقيق والتكيف الذكي / Precision Execution & Self-Correction]:\n'
+                    '   - For standard app UI elements present in the XML UI Dump, trust the exact UI Dump coordinates first.\n'
+                    '   - For games, canvases, and visual elements, read the exact (x,y) pixel coordinates from the yellow calibrated grid on the screenshot (avoid top HUD settings/pause icons at y < 380 unless requested).\n'
+                    '   - Only batch multiple moves in "steps" when you are 100% certain every move in the sequence is currently valid and unblocked; if later moves depend on how the board changes, execute 1 to 3 verified moves first, observe the new frame, and plan the next move.\n'
+                    '   - If you receive "⚠️ COGNITIVE FEEDBACK (NO SCREEN CHANGE DETECTED)", your previous target was blocked or non-interactive — never repeat it; immediately diagnose why it was blocked and pick a valid prerequisite or alternative target.\n'
+                    '4. [الوعي بحدود المهمة / Strict Goal Boundary]: Continuously compare the live screen against the user\'s original instructions. The moment the requested task or level is accomplished, STOP calling tools immediately and present your clear final summary!';
                 systemPrompt = systemPrompt.isEmpty
                     ? agentImageInstruction
                     : '$systemPrompt\n\n$agentImageInstruction';
