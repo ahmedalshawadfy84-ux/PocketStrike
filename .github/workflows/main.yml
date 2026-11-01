@@ -106,7 +106,7 @@ jobs:
                       private set
               }
 
-                  @Volatile
+              @Volatile
               private var lastFrameHash: String = ""
 
               @Volatile
@@ -138,37 +138,24 @@ jobs:
                   lastFrameHash = ""
               }
 
-              /**
-               * Captures the live screen with the proven clean Calibrated (x, y) Coordinate Grid
-               * so Vision models read exact car/button coordinates directly from the image on the 1st try.
-               */
               fun captureScreenVision(): String {
-                  var capturedBitmap = takeScreenshotWithRetry()
+                  val capturedBitmap = takeScreenshotWithRetry()
                   val dm = resources.displayMetrics
-                  // Use exact hardware screenshot dimensions (1080x2400 on Samsung Galaxy M52 5G) so grid coordinates match dispatchGesture 1:1
                   val screenW = capturedBitmap?.width ?: dm.widthPixels
                   val screenH = capturedBitmap?.height ?: dm.heightPixels
                   lastRealWidth = screenW
                   lastRealHeight = screenH
-                  val orientation = if (screenW > screenH) "Landscape (Game Mode)" else "Portrait"
+                  val orientation = if (screenW > screenH) "Landscape" else "Portrait"
 
                   val sb = StringBuilder()
                   val root = rootInActiveWindow
-                  val activePkg = root?.packageName?.toString() ?: "unknown_or_fullscreen_game"
+                  val activePkg = root?.packageName?.toString() ?: "fullscreen_game_or_app"
 
                   sb.appendLine("=== LIVE SCREEN VISION (${screenW}x${screenH} $orientation | App: $activePkg) ===")
-                  sb.appendLine(
-                      "COORDINATE GUIDE: Read real screen (x,y) pixel coordinates directly from the yellow grid labels drawn on the attached image."
-                  )
-                  sb.appendLine(
-                      "SAFETY & STOP CHECK: (1) NEVER tap Top-Right/Top-Left HUD corners (y < ${(screenH * 0.16).toInt()}) where Settings/Pause gear icons live. " +
-                          "(2) Check the current Level/screen state against the user's request: if the requested level or goal is already completed (e.g. user asked for Level 1 only and screen shows Victory or Level 2), STOP calling tools immediately and report completion!"
-                  )
 
                   val bmp = capturedBitmap
                   if (bmp != null) {
                       try {
-                          // 1. Downscale so longest side <= 1024px, JPEG quality 68
                           val maxDim = 1280
                           val scale = min(1.0f, maxDim.toFloat() / max(bmp.width, bmp.height).toFloat())
                           val targetW = max(1, (bmp.width * scale).toInt())
@@ -176,7 +163,6 @@ jobs:
                           val scaled = Bitmap.createScaledBitmap(bmp, targetW, targetH, true)
                               .copy(Bitmap.Config.ARGB_8888, true)
 
-                          // Check MD5 hash of clean frame to detect if last action failed to change screen
                           val cleanBaos = ByteArrayOutputStream()
                           scaled.compress(Bitmap.CompressFormat.JPEG, 65, cleanBaos)
                           val newHash = md5Hex(cleanBaos.toByteArray())
@@ -185,17 +171,12 @@ jobs:
 
                           if (wasUnchanged) {
                               sb.appendLine(
-                                  "⚠️ COGNITIVE FEEDBACK (NO SCREEN CHANGE DETECTED): The screen state did NOT change after your previous action! " +
-                                      "This means the target you interacted with is currently blocked by an obstacle/rule, non-interactive, disabled, or requires a prerequisite step first. " +
-                                      "Do NOT repeat the exact same action or coordinates — analyze the visual rules, obstacles, and active indicators on screen, then choose a valid alternative!"
+                                  "⚠️ COGNITIVE FEEDBACK (NO SCREEN CHANGE): The screen did NOT change after your last action! " +
+                                      "The target you tapped is BLOCKED (e.g. a car without cartoon eyes 👀 or obstructed by another car/wall) or non-interactive. " +
+                                      "Do NOT tap the same coordinates again — look closely at the image for elements that are actually free/unblocked!"
                               )
                           }
 
-                          // 2. Run On-Device Visual Radar (for text-only local models)
-                          val radarReport = analyzeBitmapForGames(bmp, screenW, screenH)
-                          sb.appendLine(radarReport)
-
-                          // 3. Draw ONLY the clean calibrated (x,y) coordinate grid (no red boxes covering cars!)
                           drawCalibratedCoordinateGrid(scaled, screenW, screenH)
 
                           val outFile = File(applicationContext.cacheDir, "human_eye_latest.jpg")
@@ -207,21 +188,23 @@ jobs:
                           bmp.recycle()
 
                           Log.i(TAG, "vision: attached (${outFile.length()} bytes)")
+                          sb.appendLine(
+                              "Attached live screenshot with calibrated (x,y) coordinate grid. " +
+                                  "Inspect the image visually before acting, and NEVER tap top HUD corners (y < 380)."
+                          )
                           sb.appendLine("[SCREEN_VISION_IMAGE:${outFile.absolutePath}]")
                       } catch (e: Exception) {
                           try {
                               bmp.recycle()
                           } catch (_: Exception) {}
-                          Log.i(TAG, "vision: capture failed: ${e.message}")
                           sb.appendLine("Vision Frame Note: ${e.message}")
                       }
                   } else {
-                      Log.i(TAG, "vision: capture failed: null bitmap")
                       sb.appendLine("[vision: capture failed — working from UI tree dump below]")
                   }
 
                   val uiHierarchy = dumpUiHierarchy(maxNodes = 35)
-                  sb.appendLine("=== UI TREE DUMP (Exact coordinates when present) ===")
+                  sb.appendLine("=== UI ELEMENTS ===")
                   sb.appendLine(uiHierarchy)
 
                   return sb.toString().trim()
@@ -292,33 +275,29 @@ jobs:
                   return sb.toString()
               }
 
-              /**
-               * Draws a clean 6x10 coordinate grid with real-screen (x, y) labels onto the screenshot
-               * without obscuring game sprites or cars.
-               */
               private fun drawCalibratedCoordinateGrid(bmp: Bitmap, realW: Int, realH: Int) {
                   val canvas = Canvas(bmp)
                   val w = bmp.width.toFloat()
                   val h = bmp.height.toFloat()
-                  val cols = 7
-                  val rows = 12
+                  val cols = 6
+                  val rows = 10
 
                   val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(85, 0, 255, 255)
-                      strokeWidth = 1.0f
+                      color = Color.argb(95, 0, 255, 255)
+                      strokeWidth = 1.1f
                       style = Paint.Style.STROKE
                   }
                   val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(220, 255, 255, 0)
+                      color = Color.argb(230, 255, 255, 0)
                       style = Paint.Style.FILL
                   }
                   val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                      color = Color.argb(145, 0, 0, 0)
+                      color = Color.argb(155, 0, 0, 0)
                       style = Paint.Style.FILL
                   }
                   val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                       color = Color.rgb(255, 255, 100)
-                      textSize = max(10f, min(w, h) * 0.019f)
+                      textSize = max(10f, min(w, h) * 0.021f)
                       isFakeBoldText = true
                   }
 
@@ -339,114 +318,12 @@ jobs:
                           val realY = (realH * r) / rows
                           val label = "$realX,$realY"
 
-                          canvas.drawCircle(gx, gy, 3f, dotPaint)
+                          canvas.drawCircle(gx, gy, 2.8f, dotPaint)
                           val tw = textPaint.measureText(label)
                           val th = textPaint.textSize
                           canvas.drawRect(gx + 3f, gy - th, gx + tw + 7f, gy + 3f, bgPaint)
                           canvas.drawText(label, gx + 5f, gy - 1f, textPaint)
                       }
-                  }
-              }
-
-              private fun analyzeBitmapForGames(bmp: Bitmap, screenW: Int, screenH: Int): String {
-                  val cols = 8
-                  val rows = 12
-                  val bw = bmp.width
-                  val bh = bmp.height
-
-                  data class Hotspot(
-                      val screenX: Int,
-                      val screenY: Int,
-                      val contrastScore: Double,
-                      val colorLabel: String,
-                      val zoneLabel: String
-                  )
-
-                  val hotspots = mutableListOf<Hotspot>()
-
-                  for (r in 2 until (rows - 2)) { // Skip Top-HUD (r < 2) and Bottom Powerup bar (r >= rows - 2)
-                      for (c in 0 until cols) {
-                          val x0 = (c * bw) / cols
-                          val y0 = (r * bh) / rows
-                          val x1 = ((c + 1) * bw) / cols
-                          val y1 = ((r + 1) * bh) / rows
-                          val cx = (x0 + x1) / 2
-                          val cy = (y0 + y1) / 2
-
-                          val centerPixel = bmp.getPixel(cx.coerceIn(0, bw - 1), cy.coerceIn(0, bh - 1))
-                          val leftPixel = bmp.getPixel((x0 + 2).coerceIn(0, bw - 1), cy.coerceIn(0, bh - 1))
-                          val rightPixel = bmp.getPixel((x1 - 2).coerceIn(0, bw - 1), cy.coerceIn(0, bh - 1))
-                          val topPixel = bmp.getPixel(cx.coerceIn(0, bw - 1), (y0 + 2).coerceIn(0, bh - 1))
-                          val botPixel = bmp.getPixel(cx.coerceIn(0, bw - 1), (y1 - 2).coerceIn(0, bh - 1))
-
-                          val diff = (colorDiff(centerPixel, leftPixel) +
-                              colorDiff(centerPixel, rightPixel) +
-                              colorDiff(centerPixel, topPixel) +
-                              colorDiff(centerPixel, botPixel)) / 4.0
-
-                          val hsv = FloatArray(3)
-                          Color.colorToHSV(centerPixel, hsv)
-                          val saturation = hsv[1]
-                          val brightness = hsv[2]
-
-                          val score = diff * (0.6 + saturation * 0.8) * (if (brightness > 0.2f) 1.0 else 0.4)
-                          if (score > 28.0) {
-                              val realX = ((cx.toFloat() / bw.toFloat()) * screenW).toInt()
-                              val realY = ((cy.toFloat() / bh.toFloat()) * screenH).toInt()
-                              val zone = when {
-                                  c < 3 -> "Play-Arena-Left"
-                                  c >= cols - 3 -> "Play-Arena-Right"
-                                  else -> "Play-Arena-Center"
-                              }
-                              hotspots.add(
-                                  Hotspot(
-                                      screenX = realX,
-                                      screenY = realY,
-                                      contrastScore = score,
-                                      colorLabel = classifyColor(centerPixel, hsv),
-                                      zoneLabel = zone
-                                  )
-                              )
-                          }
-                      }
-                  }
-
-                  val topSpots = hotspots.sortedByDescending { it.contrastScore }.take(10)
-                  val out = StringBuilder()
-                  out.appendLine("=== VISUAL RADAR (PLAY ARENA COLOR REGIONS) ===")
-                  if (topSpots.isEmpty()) {
-                      out.appendLine("• Play arena ready. Read exact (x,y) coordinates from the yellow grid on the image.")
-                  } else {
-                      for (spot in topSpots) {
-                          out.appendLine(
-                              "• [${spot.zoneLabel}] ${spot.colorLabel} region near (${spot.screenX}, ${spot.screenY})"
-                          )
-                      }
-                  }
-                  return out.toString().trim()
-              }
-
-              private fun colorDiff(c1: Int, c2: Int): Int {
-                  return abs(Color.red(c1) - Color.red(c2)) +
-                      abs(Color.green(c1) - Color.green(c2)) +
-                      abs(Color.blue(c1) - Color.blue(c2))
-              }
-
-              private fun classifyColor(pixel: Int, hsv: FloatArray): String {
-                  val h = hsv[0]
-                  val s = hsv[1]
-                  val v = hsv[2]
-                  if (v < 0.18f) return "Dark/Black"
-                  if (s < 0.18f) return if (v > 0.82f) "Bright-White" else "Gray/Silver"
-                  return when {
-                      h < 20f || h >= 340f -> "Red/Crimson"
-                      h < 45f -> "Orange/Bronze"
-                      h < 70f -> "Yellow/Gold"
-                      h < 165f -> "Green/Emerald"
-                      h < 205f -> "Cyan/Ice"
-                      h < 265f -> "Blue/Neon"
-                      h < 340f -> "Purple/Magenta"
-                      else -> "Vibrant"
                   }
               }
 
@@ -457,7 +334,6 @@ jobs:
 
               private fun safeY(y: Float): Float {
                   val h = max(lastRealHeight, resources.displayMetrics.heightPixels).toFloat()
-                  // Protects Samsung M52 5G top punch-hole status bar (90px) and bottom 3-button navigation bar (140px)
                   return y.coerceIn(90f, max(150f, h - 140f))
               }
 
@@ -465,7 +341,7 @@ jobs:
                   return try {
                       val arr = JSONArray(stepsJson)
                       val results = mutableListOf<String>()
-                      val count = min(arr.length(), 20)
+                      val count = min(arr.length(), 15)
                       for (i in 0 until count) {
                           val obj = arr.getJSONObject(i)
                           val type = obj.optString("action_type", "tap")
@@ -484,7 +360,7 @@ jobs:
                               Thread.sleep(waitAfterMs)
                           }
                       }
-                      "Executed ${results.size} batch game steps:\n" + results.joinToString("\n")
+                      "Executed ${results.size} steps:\n" + results.joinToString("\n")
                   } catch (e: Exception) {
                       "Batch execution error: ${e.message}"
                   }
@@ -539,9 +415,9 @@ jobs:
                   }
               }
 
-              fun dumpUiHierarchy(maxNodes: Int = 60): String {
+              fun dumpUiHierarchy(maxNodes: Int = 50): String {
                   val root = rootInActiveWindow
-                      ?: return "No standard XML UI tree (Fullscreen Game / Canvas active)."
+                      ?: return "No XML UI tree (Fullscreen Game / Canvas active)."
                   val sb = StringBuilder()
                   var count = 0
 
@@ -575,7 +451,7 @@ jobs:
 
                   traverse(root)
                   return if (count == 0) {
-                      "Canvas/Game surface active (${root.packageName}) — use the yellow (x,y) coordinate grid on the attached screenshot."
+                      "Canvas/Game surface active (${root.packageName}) — inspect the attached screenshot visually."
                   } else {
                       sb.toString().trim()
                   }
@@ -1340,10 +1216,15 @@ jobs:
             static AgentTool gameAction() => AgentTool(
                   name: 'game_action',
                   description:
-                      'Executes real-time Android game moves at exact screen pixel coordinates (x, y) read from the yellow coordinate grid, and automatically captures the updated screen frame. IMPORTANT: Whenever multiple moves/taps are visible (e.g. matching 3 or 9 cars/tiles), ALWAYS pass all moves together in the "steps" array so they execute in ONE fast batch!',
+                      'Executes deliberate, human-like moves in any Android game or visual canvas at exact (x, y) coordinates read from the yellow grid, and captures the updated screen. Always fill "reasoning" FIRST to analyze the board state, obstacles, and active/unblocked elements before choosing coordinates!',
                   inputSchema: const {
                     'type': 'object',
                     'properties': {
+                      'reasoning': {
+                        'type': 'string',
+                        'description':
+                            'MANDATORY FIRST STEP: Write 1-2 concise sentences (in the user\'s language) analyzing: (1) current board/dock state & constraints, (2) which specific elements are UNBLOCKED/ACTIVE (e.g. have cartoon eyes 👀 on their windshield or an open path, NEVER blocked ones), and (3) why this move advances the goal.',
+                      },
                       'steps': {
                         'type': 'array',
                         'description':
@@ -1401,6 +1282,7 @@ jobs:
                             'Whether to capture the updated screen frame after executing the batch (default: true).',
                       },
                     },
+                    'required': ['reasoning'],
                   },
                   risk: ToolRisk.safe,
                   run: (args) async {
@@ -2535,24 +2417,34 @@ jobs:
                       ],
                     });
                   case MessageRole.tool:
-                    out.add({
-                      'role': 'user',
-                      'parts': [
+                    final toolParts = <Map<String, dynamic>>[
+                      {
+                        'functionResponse': {
+                          'name': m.toolName ?? '',
+                          'response': {'result': textContent},
+                        },
+                      },
+                      if (visionBytes != null)
                         {
-                          'functionResponse': {
-                            'name': m.toolName ?? '',
-                            'response': {'result': textContent},
+                          'inlineData': {
+                            'mimeType': 'image/jpeg',
+                            'data': base64Encode(visionBytes),
                           },
                         },
-                        if (visionBytes != null)
-                          {
-                            'inlineData': {
-                              'mimeType': 'image/jpeg',
-                              'data': base64Encode(visionBytes),
-                            },
-                          },
-                      ],
-                    });
+                    ];
+                    // Merge consecutive tool responses into a single 'user' turn as required by Gemini API
+                    if (out.isNotEmpty &&
+                        out.last['role'] == 'user' &&
+                        (out.last['parts'] as List).any(
+                          (p) => (p as Map).containsKey('functionResponse'),
+                        )) {
+                      (out.last['parts'] as List).addAll(toolParts);
+                    } else {
+                      out.add({
+                        'role': 'user',
+                        'parts': toolParts,
+                      });
+                    }
                 }
               }
               return (systemParts.isEmpty ? null : systemParts.join('\n\n'), out);
@@ -5056,6 +4948,18 @@ jobs:
                     );
                     break;
                   case AgentToolCallStartedEvent(:final call):
+                    try {
+                      final decoded = jsonDecode(call.argumentsJson);
+                      if (decoded is Map<String, dynamic>) {
+                        final r = (decoded['reasoning'] as String?)?.trim() ?? '';
+                        if (r.isNotEmpty && !buffer.toString().contains(r)) {
+                          if (buffer.isNotEmpty && !buffer.toString().endsWith('\n')) {
+                            buffer.write('\n');
+                          }
+                          buffer.write('🧠 $r\n');
+                        }
+                      }
+                    } catch (_) {}
                     final nonEmptyLines = buffer
                         .toString()
                         .split('\n')
@@ -5064,11 +4968,12 @@ jobs:
                         .toList();
                     buffer.clear();
                     if (nonEmptyLines.isNotEmpty) {
-                      final keep = nonEmptyLines.length > 3
-                          ? nonEmptyLines.sublist(nonEmptyLines.length - 3)
+                      final keep = nonEmptyLines.length > 4
+                          ? nonEmptyLines.sublist(nonEmptyLines.length - 4)
                           : nonEmptyLines;
                       buffer.write('${keep.join("\n")}\n\n');
                     }
+                    state = state.copyWith(streamingText: buffer.toString());
                     steps.add(AgentStep(
                       type: 'toolCall',
                       timestamp: DateTime.now(),
